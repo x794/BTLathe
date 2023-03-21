@@ -1,18 +1,33 @@
 HardwareSerial Servo(1);
+// shaft and machine parametres
+  int32_t radiusBorder = 260;
+  int32_t radiusShaft = 252;
+  int32_t radiusSlot = 120;
+  int32_t radiusTail = 140;
+  int32_t slice = 5;
 
-//common parameters:
+  int32_t widthSlot = 44;
+  int32_t widthGap = 5;
+  int32_t slots = 92;
+
+  int32_t borderLeft = 400;
+  int32_t borderRight = 5000;
+  int32_t center = 2500;  // point of xStart
+  int32_t leftSlot; // calculated in constructor of Cutter
+
+// common:
   const uint32_t band = 38400;
 
-// UART parameters:
+// UART:
   const uint8_t pinTx = 17;
   const uint8_t pinRx = 18;
 
-// rs485 parameters:
+// rs485:
   const uint8_t pinEnableTx = 3;
   const uint32_t delayOneByteSendBase = 11520000;           // microseconds to send one byte with band = 1
   uint32_t delayOneByteSend = delayOneByteSendBase / band;  // microseconds to send one byte with current band. It take about 100 microseconds per one byte sending on band == 115200
 
-// axis parametres:
+// axis:
   const uint8_t pinDirX = 4;
   const uint8_t pinDirY = 5;
   const uint8_t pinPulseX = 6;
@@ -21,7 +36,27 @@ HardwareSerial Servo(1);
   const uint32_t powerY = 4 * 16;
   const uint8_t speed[5] = {0x05, 0x0f, 0x2f, 0x4f, 0x7f};  // ... + 0x80 -> backward
 
-// structs and classes:
+// BLE:
+  #include <BLEDevice.h>
+  #include <BLEServer.h>
+  #include <BLEUtils.h>
+  #include <BLE2902.h>
+
+  BLEServer *pServer = NULL;
+  BLECharacteristic * pTxCharacteristic;
+  bool deviceConnected = false;
+  bool oldDeviceConnected = false;
+  uint8_t txSize = 10;
+  uint8_t txData[10];
+  uint8_t rxSize = 0;
+  uint8_t rxData[10];
+
+  #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // UART service UUID
+  #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+  #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+
+// lathe structs and classes:
 struct requestStruct {
   uint8_t head;
   uint8_t address;
@@ -277,22 +312,6 @@ class Axis {
       this -> axisNumber = axisNumber;
       this -> power = power;
     }
-    void goTo(uint8_t speed, int32_t target) {
-      go(speed, target - current);
-    }
-    void setCurrent(int32_t curr) {
-      current = curr;
-    }
-    int32_t getCurrent() {
-      return current;
-    }
-  private:
-    Codec57c codec;
-    uint8_t axisNumber;   // used to mark rs485 requests
-    int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
-    int32_t current;
-    struct requestStruct request;
-
     void go(uint8_t speed, int32_t distance) {
       if (distance == 0)
         return;
@@ -308,6 +327,21 @@ class Axis {
         delay(100);
       current += distance;
     }
+    void goTo(uint8_t speed, int32_t target) {
+      go(speed, target - current);
+    }
+    void setCurrent(int32_t curr) {
+      current = curr;
+    }
+    int32_t getCurrent() {
+      return current;
+    }
+  private:
+    Codec57c codec;
+    uint8_t axisNumber;   // used to mark rs485 requests
+    int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
+    int32_t current;
+    struct requestStruct request;
 };
 
 class Cutter {
@@ -322,39 +356,56 @@ class Cutter {
       leftSlot = center - widthSlot * (slots / 2);
       leftSlot += (slots % 2 == 0) ? (widthSlot / 2) : 0;
     }
-  private:
-    Axis x;
-    Axis y;
-    // shafts and machines parametres
-      int32_t radiusBorder = 260;
-      int32_t radiusShaft = 252;
-      int32_t radiusSlot = 120;
-      int32_t radiusTale = 140;
-      int32_t slice = 5;
-
-      int32_t center = 2500;
-      int32_t widthSlot = 44;
-      int32_t widthGap = 5;
-      int32_t slots = 92;
-
-      int32_t borderLeft = 400;
-      int32_t borderRight = 5050;
-      int32_t leftSlot;
-
-    void shaveShaft() { // 230319 reset radiusShaft to current Y value and shave shaft to this
-      radiusShaft = y.getCurrent();
-      y.goTo(speed[3], radiusBorder);
-      x.goTo(speed[4], borderLeft);
-      y.goTo(speed[0], radiusShaft + 1);
-      x.goTo(speed[2], borderRight);
-      y.goTo(speed[1], radiusShaft);
-      x.goTo(speed[1], borderLeft);
-      y.goTo(speed[3], radiusBorder);
-      x.goTo(speed[4], leftSlot);
+    void go(char dir, uint8_t speed, int32_t target) { // 230321 edjast target, edjast if target is out of border, call Axis.go(...)
+      // break in case of zero distance:
+        if (target == 0)
+          return;
+      // set new pointer, min and max limits to selected axis; or break in case of the erroneous direction:
+        Axis axis;
+        int32_t min;
+        int32_t max;
+        if (dir == 'x' || dir == 'l' || dir == 'r') {
+          axis = *(&x);
+          min = borderLeft;
+          max = borderRight;
+        }
+        else if (dir == 'y' || dir == 'i' || dir == 'o') {
+          axis = *(&y);
+          min = radiusSlot;
+          max = radiusBorder;
+        }
+        else
+          return;
+      // adjust target in case relative coordinate
+        int32_t distance = target;
+        if (dir == 'r' || dir == 'o') // coordinate rise case
+          target = axis.getCurrent() + distance;
+        if (dir == 'l' || dir == 'i') // coordinate reduce case
+          target = axis.getCurrent() - distance;
+      // adjust target in out of border cases:
+        if (target < min)
+          target = min;
+        if (target > max);
+          target = max;
+      // call adjasted axis.go()
+      distance = target - axis.getCurrent();
+      axis.go(speed, distance);
     }
-    void sliceShaft() { // 230317 cuts all slots
+    void shaveShaft() { // s 230319 reset radiusShaft to current Y value and shave shaft to this
+      radiusShaft = y.getCurrent();
+      go('y', speed[3], radiusBorder);
+      go('x', speed[4], borderLeft);
+      go('y', speed[3], radiusShaft + 1);
+      go('x', speed[2], borderRight);
+      go('y', speed[1], radiusShaft);
+      go('x', speed[1], borderLeft);
+      go('y', speed[3], radiusBorder);
+      go('x', speed[4], leftSlot);
+      go('y', speed[2], radiusShaft);
+    }
+    void sliceShaft() { // c 230317 cuts all slots
       int32_t xGap = widthGap;
-      int32_t yCurrent = radiusShaft;
+      int32_t yCurrent = y.getCurrent();
       int32_t yTarget = radiusShaft;
       while (yCurrent < radiusSlot) {
         yTarget = (yTarget - slice < radiusSlot) ? radiusSlot : yTarget - slice;
@@ -363,64 +414,211 @@ class Cutter {
           cutSlot(leftSlot + i * widthSlot, xGap, yCurrent, yTarget);
         yCurrent = yTarget;
       }
-      x.goTo(speed[3], leftSlot + (slots * widthSlot));  // come to tales left side
+      // come close to the left side of tail
+        go('x', speed[3], leftSlot + (slots * widthSlot));
+        go('y', speed[2], radiusShaft);
     }
-    void cutSlot(int32_t xTarget, int32_t xGap, int32_t yCurrent, int32_t yTarget) { // 230317
-      y.goTo(speed[3], radiusBorder);
-      x.goTo(speed[4], xTarget);
-      y.goTo(speed[3], yCurrent);
-      y.goTo(speed[1], yTarget);
-      x.goTo(speed[1], xTarget + xGap);
-      x.goTo(speed[1], xTarget - xGap);
-      x.goTo(speed[3], xTarget);
-      y.goTo(speed[3], radiusBorder);
-    }
-    void cutTale() { // 230319
+    void cutTail() {    // t 230319
       int32_t left = x.getCurrent();
       int32_t right = borderRight;
-      int32_t bottom = radiusTale;
+      int32_t bottom = radiusTail;
       int32_t current = radiusShaft;
       int32_t target = current - slice;
-      x.goTo(speed[4], right);
+      go('x', speed[4], right);
       while (target > bottom + 1) {
-        y.goTo(speed[1], target);
-        x.goTo(speed[1], left + 1);
-        x.goTo(speed[4], right);
+        go('x', speed[4], right);
+        go('y', speed[1], target);
+        go('x', speed[1], left + 1);
         target += slice;
       }
-      // prefinish walk
-        y.goTo(speed[1], radiusTale + 1);
-        x.goTo(speed[1], left + 1);
-      // finish walk
-        preciseTale();
+      // come close to precise cut of tail
+        go('x', speed[4], right);
+        go('y', speed[1], radiusTail + 1);
+        go('x', speed[1], left + 1);
+      // precise cut of tail
+        preciseTail();
     }
-    void preciseTale() { // 230319 - make corner (1 tenth left & 1 tenth deep from current)
+    void preciseTail() {// p 230319 - make corner (1 tenth left & 1 tenth deep from current)
       int32_t left = x.getCurrent() - 1;
       int32_t right = borderRight;
       int32_t bottom = y.getCurrent() - 1;
       // finish walk
-        y.goTo(speed[4], radiusShaft);
-        x.goTo(speed[1], left);
-        y.goTo(speed[1], bottom);
-        x.goTo(speed[1], right);
+        go('y', speed[3], radiusShaft);
+        go('x', speed[1], left);
+        go('y', speed[1], bottom);
+        go('x', speed[1], right);
       // back to new corner
-        y.goTo(speed[4], radiusShaft);
-        x.goTo(speed[4], left);
+        go('y', speed[3], radiusShaft);
+        go('x', speed[3], left);
+    }
+    void getCurrent(int32_t * coordinates) {
+      coordinates[0] = x.getCurrent();
+      coordinates[1] = y.getCurrent();
+    }
+  private:
+    Axis x;
+    Axis y;
+    void cutSlot(int32_t xTarget, int32_t xGap, int32_t yCurrent, int32_t yTarget) { // 230317
+      go('y', speed[3], radiusBorder);
+      go('x', speed[4], xTarget);
+      go('y', speed[3], yCurrent);
+      go('y', speed[1], yTarget);
+      go('x', speed[1], xTarget + xGap);
+      go('x', speed[1], xTarget - xGap);
+      go('x', speed[3], xTarget);
+      go('y', speed[3], radiusBorder);
     }
 };
 
-// objects creation:
+class Manipulator {
+  public:
+    Manipulator(Cutter cutter) {
+      this -> cutter = cutter;
+      this -> link = link;
+    }
+    void pollBLE() {
+      if (deviceConnected) {
+        pTxCharacteristic->getValue();  // put incoming value to rxData[]
+
+        if (rxData[0] > 0x30) {
+          if (rxData[0] < 0x35) {
+            uint8_t speed = (uint8_t) (rxData[0] - 0x30); // 0 = BLE 0x30 = uint 0
+            char direction =   (char) (rxData[1] + 0x04);   // 0 = BLE 0x61 = char 65
+            int32_t target = 0;
+            for (int i = 2; i < rxSize; i++)
+              target = target * 10 + (int32_t) (rxData[i] - 0x30);
+            cutter.go(direction, speed, target);
+          }
+          if (rxData[0] == 0x73)  // s
+            cutter.shaveShaft();
+          if (rxData[0] == 0x63)  // c
+            cutter.sliceShaft();
+          if (rxData[0] == 0x74)  // t
+            cutter.cutTail();
+          if (rxData[0] == 0x70)  // p
+            cutter.preciseTail();
+
+          // send current coordinates to BLE
+            int32_t coordinates[2];
+            cutter.getCurrent(coordinates);
+            Serial.println((String) coordinates[0] + '.' + (String) coordinates[1]);
+
+            txData[0] = 0x0D;
+            txData[1] = (uint8_t) (((coordinates[0] %   1000) /  100) + 0x30);
+            txData[2] = (uint8_t) (((coordinates[0] %    100) /   10) + 0x30);
+            txData[3] = (uint8_t) (((coordinates[0] %     10) /    1) + 0x30);
+            txData[4] = 0x2E;  // period
+            txData[5] = (uint8_t) (((coordinates[1] % 100000) / 1000) + 0x30);
+            txData[6] = (uint8_t) (((coordinates[1] %   1000) /  100) + 0x30);
+            txData[7] = (uint8_t) (((coordinates[1] %    100) /   10) + 0x30);
+            txData[8] = (uint8_t) (((coordinates[1] %     10) /    1) + 0x30);
+            txData[9] = 0x0D;
+
+            // txData[0] = 0x0d;
+            // txData[1] = rxData[0];
+            // txData[2] = rxData[1];
+            // txData[3] = rxData[2];
+            // txData[4] = rxData[3];
+            // txData[5] = rxData[4];
+            // txData[6] = 0x0d;
+
+            pTxCharacteristic->setValue((uint8_t*) &txData, (size_t) txSize);
+            pTxCharacteristic->notify();
+            delay(10); // bluetooth stack will go into congestion, if too many packets are sent
+            for (int i = 0; i < rxSize; i++)
+              rxData[i] = 0x00;
+        }
+      }
+      // disconnecting
+        if (!deviceConnected && oldDeviceConnected) {
+          delay(1000); // give the bluetooth stack the chance to get things ready
+          pServer->startAdvertising(); // restart advertising
+          Serial.println("start advertising");
+          oldDeviceConnected = deviceConnected;
+        }
+      // connecting
+        if (deviceConnected && !oldDeviceConnected) {
+        // do stuff here on connecting
+          oldDeviceConnected = deviceConnected;
+        }
+
+    }
+  void pollSRV() {
+  }
+
+  private:
+  Cutter cutter;
+  Link485 link;
+};
+
+// BLE classes:
+  class MyServerCallbacks: public BLEServerCallbacks {
+      void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+      };
+
+      void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+      }
+  };
+
+  class MyCallbacks: public BLECharacteristicCallbacks {
+      void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        if (rxValue.length() > 0) {
+          rxSize = rxValue.length() - 1; // circumcise LR-symbol
+          for (int i = 0; i < rxSize; i++)
+            rxData[i] = rxValue[i];
+        }
+      }
+  };
+
+
+// objects:
   LinkUART uart(pinRx, pinTx, band);
   Link485 rs485(uart, pinEnableTx, delayOneByteSend);  // disable this line to use uart instead of rs485
   Codec57c codec(rs485);                               // specify rs485 or uart
   Axis x(codec, 0x01, powerX);
   Axis y(codec, 0x02, powerY);
   Cutter cutter(x, y);
+  Manipulator manipulator(cutter);
 
 void setup() {
-  delay(2000);
+  // BLE setup
+    // Create the BLE Device
+      BLEDevice::init("UART Service");
+
+    // Create the BLE Server
+      pServer = BLEDevice::createServer();
+      pServer->setCallbacks(new MyServerCallbacks());
+
+    // Create the BLE Service
+      BLEService *pService = pServer->createService(SERVICE_UUID);
+
+    // Create a BLE Characteristic
+      pTxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_TX,
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+                          
+      pTxCharacteristic->addDescriptor(new BLE2902());
+
+      BLECharacteristic * pRxCharacteristic = pService->createCharacteristic(
+                          CHARACTERISTIC_UUID_RX,
+                          BLECharacteristic::PROPERTY_WRITE
+                        );
+
+      pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+    // Start the service
+      pService->start();
+
+    // Start advertising
+      pServer->getAdvertising()->start();
+      Serial.println("Waiting a client connection to notify...");
 }
 
 void loop() {
-  delay(2000);
+  delay(100);
+  manipulator.pollBLE();
 }
