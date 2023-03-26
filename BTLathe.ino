@@ -15,6 +15,11 @@ HardwareSerial SerialY(2);
   int32_t borderRight = 5000;
   int32_t center = 2500;  // point of xStart
   int32_t leftSlot; // calculated in constructor of Cutter
+  
+  #define FREE 0
+  #define GOUP 1
+  #define BUSY 2
+  #define SEND 3
 
 // common:
   const uint32_t band = 38400;
@@ -48,191 +53,134 @@ HardwareSerial SerialY(2);
   #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 // lathe structs and classes:
-struct requestStruct {
-  uint8_t head;
-  uint8_t address;
+struct commandStruct {
+  uint8_t driverIndex;
   uint8_t function;
   uint8_t dataByte;
   int32_t data;
 };
 
-class LinkUART {
+class Driver57 {
   public:
-    LinkUART(HardwareSerial &SerialServo_) : SerialServo{SerialServo_} {
-      Serial.println("init uart...");
-      Serial.println(SerialServo_);
-      Serial.println(SerialServo);      
+    Driver57(HardwareSerial &SerialServo_) : SerialServo{SerialServo_} {
+      Serial.println("init readNextByteRecursive..");
     }
-    bool read(uint8_t bytecode[10]) {      // try reading to incomed array, and return true if success
-      Serial.println("  uart.read() start, call clearBytecode(), recursion uart.readServo()"); //marker
-      clearBytecode(bytecode);
-      // readServo() - recursion - start from bytecode[0], indexCRC == 9 (will been corrected in i=2 itteration)
-      uint8_t bytecodeSize = readServo(bytecode, 0, 9);
-      reportOutput("  uart.read() - bytecodeSize: " + (String) bytecodeSize + ", bytecode: ", bytecode, bytecodeSize);
-      return (bytecodeSize > 0);
+    bool pull(struct commandStruct &answer) {
+      Serial.println("\ndriver.getRecord) - call readBytecode()"); //marker
+      uint8_t bytecode[10];
+      if (readBytecode(bytecode)) {
+        answer.driverIndex = bytecode[1];
+        answer.function = bytecode[2];
+        switch (answer.function) {          
+          case 0x30:
+            answer.dataByte = 0;
+            answer.data = getInt32FromFFFF4FFF(&bytecode[5]);
+            break;
+          case 0x33:
+            answer.dataByte = 0;
+            answer.data = getInt32FromBytecode32(&bytecode[3]);
+            break;
+          case 0x39:
+            answer.data = getInt32FromBytecode16(&bytecode[3]);
+            break;
+          default:
+            answer.dataByte = (uint8_t) bytecode[3];
+            answer.data = 0;
+        }
+        Serial.println("driver.pull(&answer) - parsed uart bytecode stream, packed it to answer, return true"); //marker
+        return true;
+      }
+      Serial.println("driver.pull(&answer) - can't find/parse uart bytecode stream, return false"); //marker
+      return false;
     }
-    void write(uint8_t bytecode[10], uint8_t bytecodeSize) {
-      SerialServo.write(bytecode, bytecodeSize);  // send bytecode to UART
-      reportOutput("  UART send:", bytecode, bytecodeSize); // send bytecode to console
+    void push(struct commandStruct command) {
+      uint8_t bytecode[10];
+      uint8_t bytecodeSize = 0;
+      bytecode[0] = 0xFA;
+      bytecode[1] = command.driverIndex;
+      bytecode[2] = command.function;
+      
+      switch (bytecode[2]) {
+        case 0x30: case 0x33: case 0x39: case 0x3A: case 0x3B: case 0x3D: case 0x3E:
+          bytecode[3] = getCRC(bytecode, 3);
+          bytecodeSize = 4;
+          break;
+        case 0x80: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x88: case 0x89:
+        case 0x8A: case 0x8B: case 0x3F: case 0xF3: case 0xF6: case 0xF7: case 0xFF:
+          bytecode[3] = command.dataByte;
+          bytecode[4] = getCRC(bytecode, 4);
+          bytecodeSize = 5;
+          break;
+        case 0xFD:
+          bytecode[3] = command.dataByte;
+          bytecode[4] = (command.data % 0x100000000) / 0x1000000;
+          bytecode[5] = (command.data % 0x1000000) / 0x10000;
+          bytecode[6] = (command.data % 0x10000) / 0x100;
+          bytecode[7] = (command.data % 0x100) / 0x1;          
+          bytecode[8] = getCRC(bytecode, 8);
+          bytecodeSize = 9;
+          break;
+      }
+      SerialServo.write(bytecode, bytecodeSize);
     }
   private:
     HardwareSerial & SerialServo;
-    void clearBytecode(uint8_t bytecode[10]) {
-      Serial.println("    uart.clearBytecode"); //marker
-      for (int i = 0; i < 10; i++)
-          bytecode[i] = 0x00;
+    bool readBytecode(uint8_t bytecode[10]) { // return true if successfull read, check, put bytecode
+      Serial.println("  readBytecode() start, call clear(bytecode), recursion readNextByteRecursive()"); //marker
+      // readNextByteRecursive(bytecodeHolder, iteration, indexCRC_default)
+      uint8_t bytecodeSize = readNextByteRecursive(bytecode, 0, 9);
+      reportOutput("  readBytecode() - bytecodeSize: " + (String) bytecodeSize + ", bytecode: ", bytecode, bytecodeSize);
+      return (bytecodeSize > 0);
     }
-    bool checkCRC(uint8_t bytecode[10], int indexCRC) {
-      uint8_t crc = 0;
-      for (int i = 0; i < indexCRC; i++)
-        crc += bytecode[i];
-      bool result = (crc == bytecode[indexCRC]);
-      Serial.println("    uart.checkCRC() - return " + (String) result); //marker      
-      return (result);
-    }
-    uint8_t readServo(uint8_t bytecode[10], int i, int indexCRC) {  // get target bytecode array, index of current uint8_t to read, size of array to read
+    uint8_t readNextByteRecursive(uint8_t bytecode[10], int i, int indexCRC) {  // get target bytecode array, index of current uint8_t to read, size of array to read
       uint32_t waiter = 0;
       while ((waiter++ < 10000) && !SerialServo.available())  // wait next byte
         delayMicroseconds(1);
-      Serial.print("    uart.readServo() - waiter: " + (String) waiter);
+      Serial.print("    readNextByteRecursive() - waiter: " + (String) waiter);
       if (SerialServo.available()) {
         uint8_t incoming = SerialServo.read();
         bytecode[i] = incoming;
         Serial.print(", read: ");       //marker
         Serial.println(incoming, HEX);  //marker
         if (i == 0 && incoming == 0xFB)     // continue the reading only if flag 0xFB catched
-          return readServo(bytecode, i + 1, indexCRC);
+          return readNextByteRecursive(bytecode, i + 1, indexCRC);
         else if (i == 1 && (incoming == 0x01 || incoming == 0x02)) // continue the reading only if motors number < 3
-          return readServo(bytecode, i + 1, indexCRC);
+          return readNextByteRecursive(bytecode, i + 1, indexCRC);
         else if (i == 2) {                  // continue the reading only if correct command detected
           if (incoming == 0x30)
-            return readServo(bytecode, i + 1, 9); // 3+6, send indexCRC = 9
+            return readNextByteRecursive(bytecode, i + 1, 9); // 3+6, send indexCRC = 9
           else if (incoming == 0x33)
-            return readServo(bytecode, i + 1, 7); // 3+4, send indexCRC = 7
+            return readNextByteRecursive(bytecode, i + 1, 7); // 3+4, send indexCRC = 7
           else if (incoming == 0x39)
-            return readServo(bytecode, i + 1, 5); // 3+2, send indexCRC = 5
+            return readNextByteRecursive(bytecode, i + 1, 5); // 3+2, send indexCRC = 5
           else if (incoming >= 0x3A || incoming == 0x3B || incoming == 0x3D || incoming == 0x3E ||
                    incoming == 0x80 || incoming == 0x82 || incoming == 0x83 || incoming == 0x84 ||
                    incoming == 0x85 || incoming == 0x86 || incoming == 0x88 || incoming == 0x89 ||
                    incoming == 0x8A || incoming == 0x8B || incoming == 0x3F || incoming == 0xF3 ||
                    incoming == 0xF6 || incoming == 0xF7 || incoming == 0xFF || incoming == 0xFD )
-            return readServo(bytecode, i + 1, 4); // 3+1, send indexCRC = 4
+            return readNextByteRecursive(bytecode, i + 1, 4); // 3+1, send indexCRC = 4
         }
         else if (i > 2 && i < indexCRC)          // continue the reading only if the expected data is receiving
-          return readServo(bytecode, i + 1, indexCRC);
+          return readNextByteRecursive(bytecode, i + 1, indexCRC);
         else if (i == indexCRC && checkCRC(bytecode, indexCRC)) // it is the last recursive itteration - it checks the CRC
             return i + 1;
       }
-      Serial.println("\n    uart.readServo() - correct bytecode not founded"); //marker
-      clearBytecode(bytecode);
+      Serial.println("\n    readNextByteRecursive() - correct bytecode not founded"); //marker
       return 0;                   // if correct command was not detected - return bytecodeSize = 0
-    }
-    void reportOutput(String direction, uint8_t* bytecode, uint8_t bytecodeSize) {
-      Serial.print(direction);
-      for (int i = 0; i < 10; i++) {
-        Serial.print((bytecodeSize == i) ? "." : " ");
-        Serial.print(bytecode[i], HEX);
-      }
-      Serial.println();
-    }
-};
-
-class Codec57c {
-  public:
-    Codec57c(LinkUART& link_) : link{link_} {
-    }
-    bool read(struct requestStruct& request) {
-      Serial.println("\ncodec.read() - call clearRequest(), call link.read()"); //marker
-      clearRequest(request);
-      uint8_t bytecode[10];
-      if (link.read(bytecode)) {
-        request.head = bytecode[0];
-        request.address = bytecode[1];
-        request.function = bytecode[2];
-        request.dataByte = 0;
-        request.data = 0;
-        switch (request.function) {          
-          case 0x30:
-            request.data = getInt32FromFFFF4FFF(&bytecode[5]);
-            break;
-          case 0x33:
-            request.data = getInt32FromBytecode32(&bytecode[3]);
-            break;
-          case 0x39:
-            request.data = getInt32FromBytecode16(&bytecode[3]);
-            break;
-          default:
-            request.dataByte = (uint8_t) bytecode[3];
-        }
-        Serial.println("codec.read() - repack bytecode to struct, return true"); //marker
-        return true;
-      }
-      Serial.println("codec.read() - return false"); //marker
-      return false;
-    }
-    void write(struct requestStruct request) {
-      uint8_t bytecode[10];
-      uint8_t bytecodeSize = 0;
-      bytecode[0] = request.head;
-      bytecode[1] = request.address;
-      bytecode[2] = request.function;
-      
-      switch (bytecode[2]) {
-        case 0x30:
-        case 0x33:
-        case 0x39:
-        case 0x3A:
-        case 0x3B:
-        case 0x3D:
-        case 0x3E:
-          bytecode[3] = getCRC(bytecode, 3);
-          bytecodeSize = 4;
-          break;
-        case 0x80:
-        case 0x82:
-        case 0x83:
-        case 0x84:
-        case 0x85:
-        case 0x86:
-        case 0x88:
-        case 0x89:
-        case 0x8A:
-        case 0x8B:
-        case 0x3F:
-        case 0xF3:
-        case 0xF6:
-        case 0xF7:
-        case 0xFF:
-          bytecode[3] = request.dataByte;
-          bytecode[4] = getCRC(bytecode, 4);
-          bytecodeSize = 5;
-          break;
-        case 0xFD:
-          bytecode[3] = request.dataByte;
-          bytecode[4] = (request.data % 0x100000000) / 0x1000000;
-          bytecode[5] = (request.data % 0x1000000) / 0x10000;
-          bytecode[6] = (request.data % 0x10000) / 0x100;
-          bytecode[7] = (request.data % 0x100) / 0x1;          
-          bytecode[8] = getCRC(bytecode, 8);
-          bytecodeSize = 9;
-          break;
-      }
-      link.write(bytecode, bytecodeSize);
-    }
-  private:
-    LinkUART &link;
-    void clearRequest(struct requestStruct& request) {
-      request.head = 0;
-      request.address = 0;
-      request.function = 0;
-      request.data = 0;
-      request.dataByte = 0;
     }
     uint8_t getCRC(uint8_t bytecode[10], int indexCRC) {
       uint8_t crc = 0;
       for (int i = 0; i < indexCRC; i++)
         crc += bytecode[i];
       return crc;
+    }
+    bool checkCRC(uint8_t bytecode[10], int indexCRC) {
+      uint8_t crc = 0;
+      for (int i = 0; i < indexCRC; i++)
+        crc += bytecode[i];
+      bool result = (crc == bytecode[indexCRC]);
+      Serial.println("    readNextByteRecursivecheckCRC() - return " + (String) result); //marker      
+      return (result);
     }
     int getInt32FromFFFF4FFF(uint8_t arr[4]) {
       int32_t result = getInt32FromBytecode16(&arr[0]) * 0x4000
@@ -252,11 +200,19 @@ class Codec57c {
       int32_t result = (int32_t) preResult;
       return result;
     }
+    void reportOutput(String direction, uint8_t* bytecode, uint8_t bytecodeSize) {
+      Serial.print(direction);
+      for (int i = 0; i < 10; i++) {
+        Serial.print((bytecodeSize == i) ? "." : " ");
+        Serial.print(bytecode[i], HEX);
+      }
+      Serial.println();
+    }
 };
 
 class Axis {
   public:
-    Axis(Codec57c& codec_, uint8_t axisNumber_, int32_t power_) : codec{codec_}, axisNumber{axisNumber_}, power{power_} {
+    Axis(Driver57& driver_, uint8_t axisNumber_, int32_t power_) : driver{driver_}, axisNumber{axisNumber_}, power{power_} {
     }
     void go(uint8_t speed, int32_t distance, bool lockCurrent) {
       if (distance == 0)
@@ -266,33 +222,48 @@ class Axis {
         pulses = -pulses;
         speed += 0x80;
       }
-      // send request to go
-      codec.write(requestStruct {0xFA, axisNumber, 0xFD, speed, pulses});
-      // wait fot response to go
-      while(!(codec.read(request) && (request.head == 0xFB) 
-                                  && (request.address == axisNumber)
-                                  && (request.function == 0xFD)
-                                  && (request.dataByte == 0x02))) {
-        Serial.println("waiting loop " + (String) request.head
-                                 + " " + (String) request.address
-                                 + " " + (String) request.function
-                                 + " " + (String) request.dataByte); //marker
-      }
+      driver.push(commandStruct {axisNumber, 0xFD, speed, pulses});
       Serial.println("axis.go() - exit bytecode founded! Call setCurrent(getCurrent() + distance), finished"); //marker
       setCurrent(lockCurrent ? getCurrent() : getCurrent() + distance);
+      setStatus(SEND);
     }
-    void setCurrent(int32_t curr) {
-      current = curr;
+    void setCurrent(int32_t current_) {
+      current = current_;
     }
     int32_t getCurrent() {
       return current;
     }
+    uint8_t getStatus() {
+      return status;
+    }
+    void setStatus(uint8_t status_) {
+      status = status_;
+    }
+    bool checkAxis() {
+      struct commandStruct answer;
+      if (driver.pull(answer)) {    // try to read driver. In success case driver put answer and return true
+        if (answer.function == 0xFD && answer.dataByte == 1) {
+          if (answer.dataByte == 1)
+            setStatus(BUSY);
+          if (answer.dataByte == 2)
+            setStatus(GOUP);
+        }
+        if (answer.function == 0x39) {
+          if (answer.data >= 1)
+            setStatus(GOUP);
+          if (answer.data < 1 && getStatus() == GOUP)
+            setStatus(FREE);            
+        }
+        return true;
+      }
+      return false;
+    }
   private:
-    Codec57c &codec;
-    uint8_t axisNumber;   // used to mark rs485 requests
+    Driver57 &driver;
+    uint8_t axisNumber;   // used to mark rs485 commands
     int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
     int32_t current = 12345;
-    struct requestStruct request;
+    uint8_t status = GOUP;
 };
 
 class Cutter {
@@ -322,7 +293,7 @@ class Cutter {
         if (rxData[0] = 'l')
           rxData[0] = 0x32;
         
-        // check single move request:
+        // check single move command:
         if ((rxData[0] > 0x2F) && (rxData[0] < 0x35)) {
           uint32_t speedIndex = (uint8_t) (rxData[0] - 0x30); // 0 = BLE 0x30 = uint 0
           char direction = (char) rxData[1];
@@ -332,8 +303,8 @@ class Cutter {
           Serial.println("\nmanipulator.checkBLE() - received rxData[] - call cutter.go(" + (String) direction + ", " + (String) speed[speedIndex] + ", " + (String) target + ", " + lockCurrent + ");"); // marker
           go(direction, speed[speedIndex], target, lockCurrent);
         }
-        
-        // check multi move requests:
+
+        // check multi move commands:
         if (rxData[0] == 's')
           shaveShaft();
         if (rxData[0] == 'c')
@@ -363,52 +334,11 @@ class Cutter {
           oldDeviceConnected = deviceConnected;
         }
     }
-    void makePause(char c) {
-      int32_t coordinates[2];
-      getCurrent(coordinates);
-
-      if (c == 'a')
-        go('y', speed[3], radiusBorder);
-      
-      fillCurrentToRxData(coordinates);
-      txData[9] = 0x5f;
-      pTxCharacteristic->setValue((uint8_t*) &txData, (size_t) txSize);
-      pTxCharacteristic->notify();
-      delay(10); // bluetooth stack will go into congestion, if too many packets are sent
-
-      txData[0] = (c == 'a') ? 'A' : 'P';
-      txData[1] = (c == 'a') ? 'L' : 'A';
-      txData[2] = (c == 'a') ? 'A' : 'U';
-      txData[3] = (c == 'a') ? 'R' : 'S';
-      txData[4] = (c == 'a') ? 'M' : 'E';
-      txData[5] = 0x0D;
-      pTxCharacteristic->setValue((uint8_t*) &txData, (size_t) 6);
-      pTxCharacteristic->notify();
-      delay(10); // bluetooth stack will go into congestion, if too many packets are sent
-
-      while (rxData[0] == 'a' || rxData[0] == 'p') {
-        delay(100);
-        checkBLE();
-      }
-      go('y', speed[1], coordinates[1]);      
+    void checkServo() { // repeat motors reading while successful
+      while (!(x.checkAxis() || y.checkAxis()));
     }
-    void fillCurrentToRxData(int32_t * coordinates) {
-      txData[0] = 0x0D; // CR - new line
-      txData[1] = ((coordinates[0] %  10000) /  1000) + 0x30;
-      txData[2] = ((coordinates[0] %   1000) /   100) + 0x30;
-      txData[3] = ((coordinates[0] %    100) /    10) + 0x30;
-      txData[4] = ((coordinates[0] %     10) /     1) + 0x30;
-      txData[5] = 0x5f; // space
-      txData[6] = ((coordinates[1] %   1000) /   100) + 0x30;
-      txData[7] = ((coordinates[1] %    100) /    10) + 0x30;
-      txData[8] = ((coordinates[1] %     10) /     1) + 0x30;
-      txData[9] = 0x0D; // CR - new line
-    }
-    void readServo() {
-    }
-    void getCurrent(int32_t * coordinates) {
-      coordinates[0] = x.getCurrent();
-      coordinates[1] = y.getCurrent();
+    uint8_t getStatus() {
+      return max(x.getStatus(), y.getStatus());
     }
   private:
     Axis &x;
@@ -522,6 +452,51 @@ class Cutter {
         go('y', speed[3], radiusShaft);
         go('x', speed[3], left);
     }
+    void fillCurrentToRxData(int32_t * coordinates) {
+      txData[0] = 0x0D; // CR - new line
+      txData[1] = ((coordinates[0] %  10000) /  1000) + 0x30;
+      txData[2] = ((coordinates[0] %   1000) /   100) + 0x30;
+      txData[3] = ((coordinates[0] %    100) /    10) + 0x30;
+      txData[4] = ((coordinates[0] %     10) /     1) + 0x30;
+      txData[5] = 0x5f; // space
+      txData[6] = ((coordinates[1] %   1000) /   100) + 0x30;
+      txData[7] = ((coordinates[1] %    100) /    10) + 0x30;
+      txData[8] = ((coordinates[1] %     10) /     1) + 0x30;
+      txData[9] = 0x0D; // CR - new line
+    }
+    void getCurrent(int32_t * coordinates) {
+      coordinates[0] = x.getCurrent();
+      coordinates[1] = y.getCurrent();
+    }
+    void makePause(char c) {
+      int32_t coordinates[2];
+      getCurrent(coordinates);
+
+      if (c == 'a')
+        go('y', speed[3], radiusBorder);
+      
+      fillCurrentToRxData(coordinates);
+      txData[9] = 0x5f;
+      pTxCharacteristic->setValue((uint8_t*) &txData, (size_t) txSize);
+      pTxCharacteristic->notify();
+      delay(10); // bluetooth stack will go into congestion, if too many packets are sent
+
+      txData[0] = (c == 'a') ? 'A' : 'P';
+      txData[1] = (c == 'a') ? 'L' : 'A';
+      txData[2] = (c == 'a') ? 'A' : 'U';
+      txData[3] = (c == 'a') ? 'R' : 'S';
+      txData[4] = (c == 'a') ? 'M' : 'E';
+      txData[5] = 0x0D;
+      pTxCharacteristic->setValue((uint8_t*) &txData, (size_t) 6);
+      pTxCharacteristic->notify();
+      delay(10); // bluetooth stack will go into congestion, if too many packets are sent
+
+      while (rxData[0] == 'a' || rxData[0] == 'p') {
+        delay(100);
+        checkBLE();
+      }
+      go('y', speed[1], coordinates[1]);      
+    }
 };
 
 // BLE classes:
@@ -578,20 +553,20 @@ void setup() {
 }
 
 // objects:
-  LinkUART uartX{SerialX};
-  LinkUART uartY{SerialY};
-  Codec57c codecX{uartX};
-  Codec57c codecY{uartY};
-  Axis x{codecX, 0x01, powerX};
-  Axis y{codecY, 0x02, powerY};
+  Driver57 driverX{SerialX};
+  Driver57 driverY{SerialY};
+  Axis x{driverX, 0x01, powerX};
+  Axis y{driverY, 0x02, powerY};
   Cutter cutter{x, y};
 
 void loop() {
-  cutter.checkBLE();
+  cutter.checkServo();
+  if (cutter.getStatus() == FREE)
+    cutter.checkBLE();
 }
-// 230325
+// 260325
 // tasks:
-  // + write zeroise(struct) before read
-  // + pack bytecode zeroise to zeroize(bytecode)
-  // - write error checker
-  // - add statuses to cutter and to axes: FREE, SEND, BUSY, GOUP
+  // add sinchronous motor turning
+  // separate class Driver57 to discrete file
+  // test alarm, pause, moves, indications
+  // cut of reports to serial monitor
