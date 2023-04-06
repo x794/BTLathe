@@ -4,6 +4,7 @@
   #include <iostream>
   #include <sstream>
   #include <iomanip>
+  #define RESOLUTION 5000
   const uint32_t band = 38400;
   bool flagAbort;
 
@@ -30,7 +31,7 @@
   const uint8_t pinRxX = 7;
   const uint32_t powerX = 4 * 16; // 4 (pulses per 1 tenth) * 16 (microstep)
   const uint32_t powerY = 4 * 64;
-  const uint8_t speed[10] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7F};  // ... + 0x80 -> backward
+  const uint8_t speed[10] = {0x01, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7F};  // ... + 0x80 -> backward
 
 // BLE:
   #include <BLEDevice.h>
@@ -139,27 +140,32 @@ class Driver57 {
       }
     }
     bool pull(struct commandStruct &answer) {
-      uint8_t bytecode[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, };
+      uint8_t bytecode[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
       if (readBytecode(bytecode)) {
         answer.driverIndex = bytecode[1];
         answer.function = bytecode[2];
+        int64_t buf64;
         switch (answer.function) {          
           case 0x30:
             answer.dataByte = 0;
-            answer.data = (((bytecode[5] * 0x100) + bytecode[6]) * 0x40 + bytecode[7]) * 0x100 + bytecode[8];
-            answer.data = (answer.data < 0x20000000) ? answer.data : answer.data - 0x40000000;
+            buf64 = (((bytecode[5] * 0x100) + bytecode[6]) * 0x40 + bytecode[7]) * 0x100 + bytecode[8];
+            buf64 = (buf64 < 0x20000000) ? buf64 : buf64 - 0x40000000;
+            // set one loop RESOLUTION
+            buf64 *= RESOLUTION;
+            buf64 /= 0x4000;
+            answer.data = (int32_t) buf64;
             break;
           case 0x33:
             answer.dataByte = 0;
             answer.data = (((bytecode[3] * 0x100) + bytecode[4]) * 0x100 + bytecode[5]) * 0x100 + bytecode[6];
             break;
           case 0x39:
+            answer.dataByte = 0;
             answer.data = bytecode[3] * 0x100 + bytecode[4];
             answer.data = (answer.data < 0x8000) ? answer.data : answer.data - 0x10000;
-            // servo57c return error with step = 3, like 2, 5, 8, 11,... Two lines below helps catch 0 angle
-            answer.data = (answer.data + 1) / 3;
-            // error == 1  ~  1/109 of full step and lets catch microstep == 1/64
-            // error == 4369  ~  1mm on 5mm step shaft
+            // set one loop RESOLUTION
+            answer.data *= RESOLUTION;
+            answer.data /= 0x10000;
             break;
           default:
             answer.dataByte = (uint8_t) bytecode[3];
@@ -280,11 +286,11 @@ class Axis {
     void setServoShift() {    // rarely used precision function
       waitOutServoErrors(0);
       int32_t servoCurrent = getServoCurrent();
-      servoShift = current * power - servoCurrent;
-      ble.push("\n    current         " + std::to_string(current));
-      ble.push("\n    current * power " + std::to_string(current * power));
-      ble.push("\n    servoCurrent    " + std::to_string(servoCurrent));
-      ble.push("\n    servoShift      " + std::to_string(servoShift));
+      servoShift = current * 100 - servoCurrent;
+      ble.push("\n    current       " + std::to_string(current));
+      ble.push("\n    current*power " + std::to_string(current * 100));
+      ble.push("\n    servoCurrent  " + std::to_string(servoCurrent));
+      ble.push("\n    servoShift    " + std::to_string(servoShift));
     }
     void waitGoConfirm(uint8_t order) {
       uint32_t start = millis();
@@ -297,8 +303,8 @@ class Axis {
     }
     void waitOutServoRollUp(int32_t target, int32_t tolerance) {
       uint32_t start = millis();
-      target *= power;
-      ble.push("\nwaitOutServoRollUp ");
+      target *= 100;
+      int32_t itt = 0;
       while (!inRange(getServoCurrent(), target - tolerance, target + tolerance));
         // if (millis() - start > 99) {
         //   start += 100;
@@ -325,10 +331,10 @@ class Axis {
         }
       // adjust parameters
         int32_t pulses = distance * power;
-        if (distance < 0) {
+        if (distance < 0)
           pulses = -pulses;
+        else
           speed += 0x80;
-        }
       // report BLE about go
         std::stringstream stream;
         stream << current << " -> " << current + distance << " speed " << (int32_t) (speed % 0x80);
@@ -341,12 +347,12 @@ class Axis {
         waitGoConfirm(1);
         waitGoConfirm(2);
       // wait support roll up to the goal
-        ble.push((std::string) "\n  confirm current take ");
-        waitOutServoRollUp(current + distance, power / 2);
-        ble.push(std::to_string(millis() - start));
+        ble.push((std::string) "\n  confirm current...");
+        waitOutServoRollUp(current + distance, 100);
+        ble.push("\n  confirm current take " + std::to_string(millis() - start));
       // turn current or servoShift
         if (lockCurrent)
-          servoShift -= distance;
+          servoShift -= (distance * 100);
         else
           current += distance;
     }
@@ -420,7 +426,6 @@ class Cutter {
       if (flagAbort) return;
       checkBLE();
       go(dir, speed, target, false);
-      ble.push("\ncurrent: " + getCurrentStr());
     }
     void go(char dir, uint8_t speed, int32_t target, bool lockCurrent) { // 230404 edjast target, edjast if target is out of border, call Axis.go(...)
       // break in case of zero distance:
@@ -441,8 +446,11 @@ class Cutter {
         distance = target - axis -> getCurrent();
         axis -> go(speed, distance, lockCurrent);
       // wait finishing
-        axis -> waitOutServoErrors(min(powerX, powerY) / 2);
-        axis2-> waitOutServoErrors(min(powerX, powerY) / 2);
+        axis -> waitOutServoErrors(10);
+        axis2-> waitOutServoErrors(10);
+        ble.push(getCurrentStr());
+        ble.push(getServoCurrentStr());
+        ble.push("\n");
     }
     void shaveShaft() { // s 230319 reset radiusShaft to current Y value and shave shaft to this
       uint32_t start = millis();
@@ -464,23 +472,32 @@ class Cutter {
       ble.push("\nsliceShaft start " + getCurrentStr());
       int32_t xGap = widthGap;
       int32_t yCurrent = y.getCurrent();
-      int32_t yTarget = radiusShaft;
+      int32_t yTarget;
+      int32_t yTarget2;
       while (yCurrent > radiusSlot) {
-        yTarget = (yTarget - slice < radiusSlot) ? radiusSlot : yTarget - slice;
+        yTarget = max(yCurrent - slice, radiusSlot);
+        yTarget2 = max(yCurrent - slice * 2, radiusSlot);
         xGap = -xGap; // reverse moves into the slots depth (may be unusefull)
         int32_t xTarget = leftSlot;
         for (int i = 0; i < slots; i++) { // cut slot
           xTarget = leftSlot + (i * widthSlot);
-          go('y', speed[6], radiusBorder);
-          go('x', speed[5], xTarget);
-          go('y', speed[6], yCurrent);
+          go('y', speed[8], radiusBorder);
+          go('x', speed[6], xTarget);
+          go('y', speed[8], yCurrent);
           go('y', speed[2], yTarget);
           go('x', speed[2], xTarget + xGap);
           go('x', speed[2], xTarget - xGap);
-          go('x', speed[4], xTarget);
-          go('y', speed[6], radiusBorder);
+          go('x', speed[5], xTarget); 
+
+          go('y', speed[2], yTarget2);
+          go('x', speed[2], xTarget - xGap);
+          go('x', speed[2], xTarget + xGap);
+          go('x', speed[5], xTarget);
+
+          go('x', speed[5], xTarget);
+          go('y', speed[8], radiusBorder);
         }
-        yCurrent = yTarget;
+        yCurrent = yTarget2;
       }
       // come close to the left side of tail
         go('x', speed[6], leftSlot + (slots * widthSlot));
@@ -546,8 +563,14 @@ class Cutter {
     }
     std::string getCurrentStr() {
       std::stringstream stream;
-      stream << "\n" << std::right << std::setfill('0') << std::setw(4) << x.getCurrent() << "_"
-                                   << std::setfill('0') << std::setw(3) << y.getCurrent() << "\n";
+      stream << "\n  100 x current " << std::right << std::setfill('0') << std::setw(6) << x.getCurrent() * 100 << "_"
+                                   << std::setfill('0') << std::setw(6) << y.getCurrent() * 100;
+      return stream.str();
+    }
+    std::string getServoCurrentStr() {
+      std::stringstream stream;
+      stream << "\n  servo current " << std::right << std::setfill('0') << std::setw(6) << x.getServoCurrent() << "_"
+                                   << std::setfill('0') << std::setw(6) << y.getServoCurrent();
       return stream.str();
     }
 };
