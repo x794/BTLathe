@@ -233,7 +233,7 @@ class Driver57 {
 class Axis {
   public:
     Axis(Driver57& driver_, uint8_t axisNumber_, int32_t dir_, int32_t power_, int32_t min_, int32_t max_, int32_t current_) 
-             : driver{driver_}, axisNumber{axisNumber_}, axisName(axisNumber_ == 1 ? 'x' : 'y'), dir{dir_}, power{power_}, min{min_}, max{max_}, current{current_} {
+             : driver{driver_}, axisNumber{axisNumber_}, axisName(axisNumber_ == 1 ? "x" : "y"), dir{dir_}, power{power_}, min{min_}, max{max_}, current{current_} {
     }
     int32_t getServoCurrent() {
       struct commandStruct answer;
@@ -248,8 +248,7 @@ class Axis {
       return answer.data;
     }
     void setServoShift() {    // rarely used precision function
-      bt.push("\n" + axisName);
-      bt.push(" calibrating...");
+      bt.push("\n" + axisName + " calibrating...");
       waitOutServoErrors(0);
       int32_t servoCurrent = getServoCurrent();
       servoShift = current * 100 - servoCurrent;
@@ -257,12 +256,11 @@ class Axis {
       bt.push("\n    current*dimen " + std::to_string(current * 100));
       bt.push("\n    servoCurrent  " + std::to_string(servoCurrent));
       bt.push("\n    servoShift    " + std::to_string(servoShift));
-      bt.push("\n" + axisName);
-      bt.push(" calibrated successful");
+      bt.push("\n" + axisName + " calibrated successful\n");
     }
     void waitGoConfirm(uint8_t order) {
       uint32_t start = millis();
-      bt.push((std::string) "\n  get waitGo(" + std::to_string(order) + ") take ");
+      // bt.push((std::string) "\n  get waitGo(" + std::to_string(order) + ") take ");
       struct commandStruct answer;
       while (!(driver.pull(answer) && answer.driverIndex == axisNumber    // try to read driver. In success case driver put answer and return true
                                    && answer.function    == 0xFD
@@ -272,15 +270,13 @@ class Axis {
     void waitOutServoRollUp(int32_t target, int32_t tolerance) {
       target *= 100;
       uint32_t start = millis();
-      bt.push("\n  wait " + axisName);
-      bt.push(" rollup");
+      bt.push("\n  wait " + axisName + " rollup...");
       while (!inRange(getServoCurrent(), target - tolerance, target + tolerance));
       bt.push(" take " + std::to_string(millis() - start));
     }
     void waitOutServoErrors(int32_t tolerance) {
       uint32_t start = millis();
-      bt.push("\n  wait " + axisName);
-      bt.push(" errors");
+      // bt.push("\n  wait " + axisName + " errors...");
       while (!inRange(getServoError(), -tolerance, tolerance));
       bt.push(" take " + std::to_string(millis() - start));
     }
@@ -297,19 +293,17 @@ class Axis {
         speed += 0x80 * ((distance * dir) > 0);
       // report BT about go
         std::stringstream stream;
-        stream << current << " -> " << current + distance << " speed " << (int32_t) speed;
+        stream << current << "->" << current + distance << "s" << (int32_t) speed;
         bt.push(stream.str());
       // request go() to driver
-        bt.push("\n  send go() take ");
+        // bt.push("\n  send go() take ");
         driver.push(commandStruct {axisNumber, 0xFD, speed, pulses});
-        bt.push(std::to_string(millis() - start));
+        // bt.push(std::to_string(millis() - start));
       // wait go() confirm
         waitGoConfirm(1);
         waitGoConfirm(2);
       // wait support roll up to the goal
-        bt.push("\n  confirm current...");
         waitOutServoRollUp(current + distance, 100);
-        bt.push("\n  confirm current take " + std::to_string(millis() - start));
       // turn current or servoShift
         if (lockCurrent)
           servoShift -= (distance * 100);
@@ -328,7 +322,7 @@ class Axis {
   private:
     Driver57 &driver;
     uint8_t axisNumber;   // used to mark rs485 commands
-    char axisName = 'c';
+    std::string axisName = "defaultAxisName";
     int32_t dir;
     int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
     int32_t min;
@@ -379,7 +373,7 @@ class Cutter {
         go(direction, speed[speedIndex], target, lockCurrent);
       }
       else
-        bt.push((std::string) "\nCommand not detected");
+        bt.push((std::string) "\nCommand not detected\n");
     }
   private:
     Axis &x;
@@ -411,22 +405,27 @@ class Cutter {
       // wait finishing
         axis -> waitOutServoErrors(10);
         axis2-> waitOutServoErrors(10);
-        bt.push(getCurrentStr());
-        bt.push(getServoCurrentStr());
-        bt.push("\n");
+        // bt.push(getCurrentStr());
+        // bt.push(getServoCurrentStr());
+        // bt.push("\n");
+      // report new current
+        std::stringstream stream;
+        stream << std::right << std::setfill('0') << std::setw(4) << x.getServoCurrent() << "_"
+                                    << std::setfill('0') << std::setw(3) << y.getServoCurrent() << "\n";
+        bt.push(stream.str());
     }
     void shaveShaft() { // s 230319 reset radiusShaft to current Y value and shave shaft to this
       uint32_t start = millis();
       bt.push("\nshaveShaft start " + getCurrentStr());
       radiusShaft = y.getCurrent();
-      go('y', speed[6], radiusBorder);
-      go('x', speed[8], borderLeft);
+      go('y', speed[6], radiusShaft + 5);
+      go('x', speed[7], borderLeft);
       go('y', speed[6], radiusShaft + 1);
-      go('x', speed[4], borderRight);
+      go('x', speed[5], borderRight);
       go('y', speed[2], radiusShaft);
-      go('x', speed[2], borderLeft);
+      go('x', speed[4], borderLeft);
       go('y', speed[6], radiusBorder);
-      go('x', speed[8], leftSlot);
+      go('x', speed[7], leftSlot);
       go('y', speed[4], radiusShaft);
       bt.push("\nshaveShaft take " + std::to_string(millis() - start));
     }
@@ -477,15 +476,15 @@ class Cutter {
       int32_t target = current - slice;
       go('x', speed[8], right);
       while (target > bottom + 1) {
-        go('x', speed[8], right);
+        go('x', speed[7], right);
         go('y', speed[2], target);
-        go('x', speed[2], left + 1);
-        target += slice;
+        go('x', speed[3], left + 1);
+        target -= slice;
       }
       // come close to precise cut of tail
-        go('x', speed[8], right);
-        go('y', speed[2], radiusTail + 1);
-        go('x', speed[2], left + 1);
+        go('x', speed[7], right);
+        go('y', speed[2], bottom + 1);
+        go('x', speed[3], left + 1);
       // precise cut of fail
         finaliseTale();
       bt.push("\ncutTale take " + std::to_string(millis() - start));
@@ -526,14 +525,14 @@ class Cutter {
     }
     std::string getCurrentStr() {
       std::stringstream stream;
-      stream << "\n  100 x current " << std::right << std::setfill('0') << std::setw(6) << x.getCurrent() * 100 << "_"
-                                   << std::setfill('0') << std::setw(6) << y.getCurrent() * 100;
+      // stream << "\n  100 x current " << std::right << std::setfill('0') << std::setw(6) << x.getCurrent() * 100 << "_"
+      //                              << std::setfill('0') << std::setw(6) << y.getCurrent() * 100;
       return stream.str();
     }
     std::string getServoCurrentStr() {
       std::stringstream stream;
-      stream << "\n  servo current " << std::right << std::setfill('0') << std::setw(6) << x.getServoCurrent() << "_"
-                                   << std::setfill('0') << std::setw(6) << y.getServoCurrent();
+      // stream << "\n  servo current " << std::right << std::setfill('0') << std::setw(6) << x.getServoCurrent() << "_"
+      //                              << std::setfill('0') << std::setw(6) << y.getServoCurrent();
       return stream.str();
     }
 };
@@ -558,6 +557,7 @@ void setup() {
   delay(5000);
   x.setServoShift();
   y.setServoShift();
+  bt.push("\nBTLathe ready to execute commands\n");
 }
 
 void loop() {
