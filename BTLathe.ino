@@ -25,30 +25,24 @@
   int32_t leftSlot; // calculated in constructor of Cutter
 
 // axes:
-  const uint8_t pinTxY = 4;
+  const uint8_t pinTxY = 18;
   const uint8_t pinRxY = 5;
-  const uint8_t pinTxX = 6;
-  const uint8_t pinRxX = 7;
+  const uint8_t pinTxX = 17;
+  const uint8_t pinRxX = 16;
+  const int32_t dirX = -1;    // rise on counterclock wise tunrinig
+  const int32_t dirY = 1;     // rise on clock wise turning
   const uint32_t powerX = 4 * 16; // 4 (pulses per 1 tenth) * 16 (microstep)
   const uint32_t powerY = 4 * 64;
   const uint8_t speed[10] = {0x01, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7F};  // ... + 0x80 -> backward
 
-// BLE:
-  #include <BLEDevice.h>
-  #include <BLEServer.h>
-  #include <BLEUtils.h>
-  #include <BLE2902.h>
+// BT:
+  #include "BluetoothSerial.h"
+  #define USE_PIN // Uncomment this to use PIN during pairing. The pin is specified on the line below
+  const char *pin = "4166"; // Change this to more secure PIN.
+  String device_name = "BTLathe";
+  BluetoothSerial SerialBT;
 
-  #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // UART service UUID
-  #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-  #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-
-  BLEServer *pServer = NULL;
-  BLECharacteristic * pTxCharacteristic;
-  bool deviceConnected = false;
-  bool oldDeviceConnected = false;
-
-// common structs, functions:
+// common structs, functions, classes:
 struct commandStruct {
   uint8_t driverIndex;
   uint8_t function;
@@ -56,74 +50,44 @@ struct commandStruct {
   int32_t data;
 };
 
-// BLE classes:
-  class BLE {
-    public:
-      BLE() {
-        Serial.begin(115200);
+class BT {
+  public:
+    BT() {
+    }
+    std::string pull() {
+      std::string result;
+      char c;
+      while (SerialBT.available()) {
+        c = SerialBT.read();
+        if (c != '\n' && c != '\r') // CR = 0x0D = 13 = \r;  LF = 0x0A = 10 = \n
+          result.push_back(c);
+        delay(2);
       }
-      void setRx(std::string &rxValue_) {
-        rx = rxValue_;
+      return result;
+    }
+    void commit(std::string tx_) {
+      tx.append(tx_);
+    }
+    void push(std::string tx_) {
+      tx.append(tx_);
+      push();
+    }
+    void push() {
+      for (int i = 0; i < tx.size(); i++) {
+        SerialBT.write(tx[i]);
+        delay(2);
       }
-      bool available() {
-        return (!rx.empty());
-      }
-      std::string pull() {
-        std::string result = rx;
-        rx.erase();
-        return result;
-      }
-      void commit(std::string tx_) {
-        tx.append(tx_);
-      }
-      void push(std::string tx_) {
-        tx.append(tx_);
-        push();
-      }
-      void push() {
-        if (deviceConnected && (tx.length() > 0)) {
-          pTxCharacteristic->setValue(tx);
-          pTxCharacteristic->notify();
-          tx.erase();
-    		delay(10); // bluetooth stack will go into congestion, if too many packets are sent
-	      }
-        // disconnecting
-        if (!deviceConnected && oldDeviceConnected) {
-            delay(500); // give the bluetooth stack the chance to get things ready
-            pServer->startAdvertising(); // restart advertising
-            Serial.println("start advertising");
-            oldDeviceConnected = deviceConnected;
-        }
-        // connecting
-        if (deviceConnected && !oldDeviceConnected) {
-        // do stuff here on connecting
-            oldDeviceConnected = deviceConnected;
-        }
-      }
-    private:
-      std::string tx;
-      std::string rx;
-  };
-  BLE ble{};  
-  class MyServerCallbacks: public BLEServerCallbacks {
-      void onConnect(BLEServer* pServer) {
-        deviceConnected = true;
-      };
-
-      void onDisconnect(BLEServer* pServer) {
-        deviceConnected = false;
-      }
-  };
-  class MyCallbacks: public BLECharacteristicCallbacks {
-      void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string rxValue = pCharacteristic->getValue();
-        ble.setRx(rxValue);
-      }
-  };
+      tx.erase();
+    }
+  private:
+    std::string tx;
+};
+BT bt{};
 
 bool inRange(int32_t item, int32_t min, int32_t max) {
   if (!(min <= item && item <= max))
-    ble.push("\n    " + std::to_string(min) + "<" + std::to_string(item) + "<" + std::to_string(max));
+    bt.push(".");
+    // bt.push("\n    " + std::to_string(min) + "<" + std::to_string(item) + "<" + std::to_string(max));
   return (min <= item && item <= max);
 }
 
@@ -268,14 +232,14 @@ class Driver57 {
 
 class Axis {
   public:
-    Axis(Driver57& driver_, uint8_t axisNumber_, int32_t power_, int32_t min_, int32_t max_, int32_t current_) 
-             : driver{driver_}, axisNumber{axisNumber_}, power{power_}, min{min_}, max{max_}, current{current_} {
+    Axis(Driver57& driver_, uint8_t axisNumber_, int32_t dir_, int32_t power_, int32_t min_, int32_t max_, int32_t current_) 
+             : driver{driver_}, axisNumber{axisNumber_}, axisName(axisNumber_ == 1 ? 'x' : 'y'), dir{dir_}, power{power_}, min{min_}, max{max_}, current{current_} {
     }
     int32_t getServoCurrent() {
       struct commandStruct answer;
       driver.push(commandStruct {axisNumber, 0x30, 0, 0});
       while (!(driver.pull(answer) && answer.driverIndex == axisNumber && answer.function == 0x30));
-      return answer.data + servoShift;
+      return servoShift + (dir * answer.data);
     }
     int32_t getServoError() { // error == 4369  ~  1mm on 5mm step shaft. Return error in range (-10922, 10923)
       struct commandStruct answer;
@@ -284,72 +248,68 @@ class Axis {
       return answer.data;
     }
     void setServoShift() {    // rarely used precision function
+      bt.push("\n" + axisName);
+      bt.push(" calibrating...");
       waitOutServoErrors(0);
       int32_t servoCurrent = getServoCurrent();
       servoShift = current * 100 - servoCurrent;
-      ble.push("\n    current       " + std::to_string(current));
-      ble.push("\n    current*power " + std::to_string(current * 100));
-      ble.push("\n    servoCurrent  " + std::to_string(servoCurrent));
-      ble.push("\n    servoShift    " + std::to_string(servoShift));
+      bt.push("\n    current       " + std::to_string(current));
+      bt.push("\n    current*dimen " + std::to_string(current * 100));
+      bt.push("\n    servoCurrent  " + std::to_string(servoCurrent));
+      bt.push("\n    servoShift    " + std::to_string(servoShift));
+      bt.push("\n" + axisName);
+      bt.push(" calibrated successful");
     }
     void waitGoConfirm(uint8_t order) {
       uint32_t start = millis();
-      ble.push((std::string) "\n  get waitGo(" + std::to_string(order) + ") take ");
+      bt.push((std::string) "\n  get waitGo(" + std::to_string(order) + ") take ");
       struct commandStruct answer;
       while (!(driver.pull(answer) && answer.driverIndex == axisNumber    // try to read driver. In success case driver put answer and return true
                                    && answer.function    == 0xFD
                                    && answer.dataByte    == order));
-      ble.push(std::to_string(millis() - start));
+      bt.push(std::to_string(millis() - start));
     }
     void waitOutServoRollUp(int32_t target, int32_t tolerance) {
-      uint32_t start = millis();
       target *= 100;
-      int32_t itt = 0;
+      uint32_t start = millis();
+      bt.push("\n  wait " + axisName);
+      bt.push(" rollup");
       while (!inRange(getServoCurrent(), target - tolerance, target + tolerance));
-        // if (millis() - start > 99) {
-        //   start += 100;
-        //   //ble.push("\n    (" + std::to_string(target / power) + ")" + std::to_string(target) + " srv" + std::to_string(target + servoShift));
-        //   int32_t servoCurrent = getServoCurrent();
-        //   ble.push("\nservoCurrent" + std::to_string(servoCurrent)
-        //                       + "=" + std::to_string(servoCurrent / power)
-        //                       + "+" + std::to_string(servoCurrent % power));
-        // }
+      bt.push(" take " + std::to_string(millis() - start));
     }
     void waitOutServoErrors(int32_t tolerance) {
       uint32_t start = millis();
-      ble.push("\n  errors...");
+      bt.push("\n  wait " + axisName);
+      bt.push(" errors");
       while (!inRange(getServoError(), -tolerance, tolerance));
-      ble.push("\n  errors take " + std::to_string(millis() - start));
+      bt.push(" take " + std::to_string(millis() - start));
     }
     void go(uint8_t speed, int32_t distance, bool lockCurrent) {
       uint32_t start = millis();
-      ble.push(axisNumber == 1 ? "\nx " : "\ny ");
+      bt.push("\n" + axisName + ' ');
       // reject trivial requests
         if (distance == 0 || speed == 0) {
-          ble.push("reject trivial go");
+          bt.push("reject trivial go");
           return;
         }
       // adjust parameters
-        int32_t pulses = distance * power;
-        if (distance < 0)
-          pulses = -pulses;
-        else
-          speed += 0x80;
-      // report BLE about go
+        int32_t pulses = abs(distance * power);
+        speed += 0x80 * ((distance * dir) > 0);
+      // report BT about go
         std::stringstream stream;
-        stream << current << " -> " << current + distance << " speed " << (int32_t) (speed % 0x80);
-        ble.push(stream.str());
+        stream << current << " -> " << current + distance << " speed " << (int32_t) speed;
+        bt.push(stream.str());
       // request go() to driver
-        ble.push((std::string) "\n  send go() take ");
+        bt.push("\n  send go() take ");
         driver.push(commandStruct {axisNumber, 0xFD, speed, pulses});
-        ble.push(std::to_string(millis() - start));
+        bt.push(std::to_string(millis() - start));
       // wait go() confirm
         waitGoConfirm(1);
         waitGoConfirm(2);
       // wait support roll up to the goal
-        ble.push((std::string) "\n  confirm current...");
+        bt.push("\n  confirm current...");
         waitOutServoRollUp(current + distance, 100);
-        ble.push("\n  confirm current take " + std::to_string(millis() - start));
+        bt.push("\n  confirm current take " + std::to_string(millis() - start));
       // turn current or servoShift
         if (lockCurrent)
           servoShift -= (distance * 100);
@@ -368,10 +328,12 @@ class Axis {
   private:
     Driver57 &driver;
     uint8_t axisNumber;   // used to mark rs485 commands
+    char axisName = 'c';
+    int32_t dir;
     int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
     int32_t min;
     int32_t max;
-    int32_t current;    // current == servo * power
+    int32_t current;     // current == servo * power
     int32_t servoShift = 0;
 };
 
@@ -381,13 +343,14 @@ class Cutter {
       leftSlot = center - widthSlot * (slots / 2);
       leftSlot += (slots % 2 == 0) ? (widthSlot / 2) : 0;
     }
-    void checkBLE() {
-      if (!ble.available())  return;
-        
+    void checkBT() {
+      if (!SerialBT.available())
+        return;
       const String strNumbers = "1234567890";
       const String strDirections = "xylrio";
-      // pull BLE
-      std::string rx = ble.pull();
+      // pull BT
+      std::string rx = bt.pull();
+      Serial.println("checkBT got <" + (String) rx.data() + ">");
       // check lockCurrent:
       bool lockCurrent = (rx[0] == 'l');
       if (rx[0] == 'l')  rx[0] = '4';
@@ -401,7 +364,7 @@ class Cutter {
         if (rx[0] == 'f')  finaliseTale();
         if (rx[0] == 'A') {
           flagAbort = true;
-          ble.push("\nProgram aborted");
+          bt.push("\nProgram aborted");
         }
       }
       // check multichar commands:
@@ -412,11 +375,11 @@ class Cutter {
         uint8_t speedIndex = std::atoi(rx.substr(0,1).c_str());
         uint8_t direction = rx[1];
         int32_t target = std::atoi(rx.substr(2,4).c_str());
-        // call go() - turn motor and report to BLE
+        // call go() - turn motor and report to BT
         go(direction, speed[speedIndex], target, lockCurrent);
       }
       else
-        ble.push((std::string) "\nCommand not detected");
+        bt.push((std::string) "\nCommand not detected");
     }
   private:
     Axis &x;
@@ -424,7 +387,7 @@ class Cutter {
 
     void go(char dir, uint8_t speed, int32_t target) {  // call unlocked go(). Intended not for manual commands!!!
       if (flagAbort) return;
-      checkBLE();
+      checkBT();
       go(dir, speed, target, false);
     }
     void go(char dir, uint8_t speed, int32_t target, bool lockCurrent) { // 230404 edjast target, edjast if target is out of border, call Axis.go(...)
@@ -448,13 +411,13 @@ class Cutter {
       // wait finishing
         axis -> waitOutServoErrors(10);
         axis2-> waitOutServoErrors(10);
-        ble.push(getCurrentStr());
-        ble.push(getServoCurrentStr());
-        ble.push("\n");
+        bt.push(getCurrentStr());
+        bt.push(getServoCurrentStr());
+        bt.push("\n");
     }
     void shaveShaft() { // s 230319 reset radiusShaft to current Y value and shave shaft to this
       uint32_t start = millis();
-      ble.push("\nshaveShaft start " + getCurrentStr());
+      bt.push("\nshaveShaft start " + getCurrentStr());
       radiusShaft = y.getCurrent();
       go('y', speed[6], radiusBorder);
       go('x', speed[8], borderLeft);
@@ -465,11 +428,11 @@ class Cutter {
       go('y', speed[6], radiusBorder);
       go('x', speed[8], leftSlot);
       go('y', speed[4], radiusShaft);
-      ble.push("\nshaveShaft take " + std::to_string(millis() - start));
+      bt.push("\nshaveShaft take " + std::to_string(millis() - start));
     }
     void sliceShaft() { // c 230325 cuts all slots
       uint32_t start = millis();
-      ble.push("\nsliceShaft start " + getCurrentStr());
+      bt.push("\nsliceShaft start " + getCurrentStr());
       int32_t xGap = widthGap;
       int32_t yCurrent = y.getCurrent();
       int32_t yTarget;
@@ -502,11 +465,11 @@ class Cutter {
       // come close to the left side of tail
         go('x', speed[6], leftSlot + (slots * widthSlot));
         go('y', speed[4], radiusShaft);
-      ble.push("\nsliceShaft take " + std::to_string(millis() - start));
+      bt.push("\nsliceShaft take " + std::to_string(millis() - start));
     }
     void cutTail() {    // t 230319
       uint32_t start = millis();
-      ble.push("\ncutTale start " + getCurrentStr());
+      bt.push("\ncutTale start " + getCurrentStr());
       int32_t left = x.getCurrent();
       int32_t right = borderRight;
       int32_t bottom = radiusTail;
@@ -525,11 +488,11 @@ class Cutter {
         go('x', speed[2], left + 1);
       // precise cut of fail
         finaliseTale();
-      ble.push("\ncutTale take " + std::to_string(millis() - start));
+      bt.push("\ncutTale take " + std::to_string(millis() - start));
     }
     void finaliseTale() {// p 230319 - make corner (1 tenth left & 1 tenth deep from current)
       uint32_t start = millis();
-      ble.push("\nfinaliseTale start " + getCurrentStr());
+      bt.push("\nfinaliseTale start " + getCurrentStr());
       int32_t left = x.getCurrent() - 1;
       int32_t right = borderRight;
       int32_t bottom = y.getCurrent() - 1;
@@ -541,25 +504,25 @@ class Cutter {
       // back to new corner
         go('y', speed[6], radiusShaft);
         go('x', speed[6], left);
-      ble.push("\nfinaliseTale take " + std::to_string(millis() - start));
+      bt.push("\nfinaliseTale take " + std::to_string(millis() - start));
     }
     void takeAlarm() {
       // remember current position:
-        ble.commit(getCurrentStr());
+        bt.commit(getCurrentStr());
         int32_t alarmY = y.getCurrent();
-      // unroll and wait next BLE command:
+      // unroll and wait next BT command:
         go('y', speed[6], radiusBorder);
-        ble.push(" ALARM !!!");
-        while (!ble.available())  delay(100);
-        checkBLE();
+        bt.push(" ALARM !!!");
+        while (!SerialBT.available())  delay(100);
+        checkBT();
       // rollback to remembered Y and continue:
         go('y', speed[2], alarmY);      
     }
     void takePause() {
-      ble.commit(getCurrentStr());
-      ble.push(" PAUSE");
-      while (!ble.available())  delay(100);
-      checkBLE();
+      bt.commit(getCurrentStr());
+      bt.push(" PAUSE");
+      while (!SerialBT.available())  delay(100);
+      checkBT();
     }
     std::string getCurrentStr() {
       std::stringstream stream;
@@ -578,46 +541,27 @@ class Cutter {
 // objects:
   Driver57 driverX{1};
   Driver57 driverY{2};
-  Axis x{driverX, 0x01, powerX, borderLeft, borderRight, center};
-  Axis y{driverY, 0x02, powerY, radiusSlot, radiusBorder, radiusBorder};
+  Axis x{driverX, 0x01, dirX, powerX, borderLeft, borderRight, center};
+  Axis y{driverY, 0x02, dirY, powerY, radiusSlot, radiusBorder, radiusBorder};
   Cutter cutter{x, y};
 
 void setup() {
-  // Create the BLE Device
-  BLEDevice::init("UART Service");
-  // Create the BLE Server
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-  // Create the BLE Service
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-  // Create a BLE Characteristic
-  pTxCharacteristic = pService->createCharacteristic(
-                    CHARACTERISTIC_UUID_TX,
-                    BLECharacteristic::PROPERTY_NOTIFY
-                  );
-  pTxCharacteristic->addDescriptor(new BLE2902());
-  BLECharacteristic * pRxCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID_RX,
-                      BLECharacteristic::PROPERTY_WRITE
-                    );
-  pRxCharacteristic->setCallbacks(new MyCallbacks());
-  // Start the service
-  pService->start();
-  // Start advertising
-  pServer->getAdvertising()->start();
-  Serial.println("Waiting a client connection to notify...");
+  // BT init:
+    Serial.begin(115200);
+    SerialBT.begin(device_name);
+    Serial.printf("The device with name \"%s\" is started.\nNow you can pair it with Bluetooth!\n", device_name.c_str());
+    #ifdef USE_PIN
+      SerialBT.setPin(pin);
+      Serial.println("Using PIN");
+    #endif
 
   delay(5000);
   x.setServoShift();
   y.setServoShift();
-  ble.push("\n");
 }
 
 void loop() {
   delay(100);
   flagAbort = false;
-  cutter.checkBLE();
+  cutter.checkBT();
 }
-// 260404
-// tasks:
-  // separate class Driver57 to discrete file
