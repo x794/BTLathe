@@ -8,6 +8,7 @@ s  shaveShaft();
 c  sliceShaft();
 t  cutTail();
 f  finaliseTale();
+h  halfShaft(); // run from the middle - halfSlotWide
 A  flagAbort = true;
 
 MultyByte commands:
