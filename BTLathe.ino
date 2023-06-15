@@ -1,6 +1,5 @@
 // common:
   HardwareSerial SerialX(1);
-  HardwareSerial SerialY(2);
   #include <iostream>
   #include <sstream>
   #include <iomanip>
@@ -26,14 +25,17 @@
   int32_t leftSlotCenter; // calculated in constructor of Cutter
 
 // axes:
-  const uint8_t pinTxY = 18;
-  const uint8_t pinRxY = 5;
-  const uint8_t pinTxX = 17;
-  const uint8_t pinRxX = 16;
-  const int32_t dirX = -1;    // rise on counterclock wise tunrinig
-  const int32_t dirY = 1;     // rise on clock wise turning
-  const uint32_t powerX = 4 * 16; // 4 (pulses per 1 tenth) * 16 (microstep)
-  const uint32_t powerY = 4 * 64;
+  const uint8_t pinDir    = 18;
+  const uint8_t pinPulse  = 5;
+  const uint8_t pinEnd    = 4;
+  const int32_t dirY      = 1;     // rise on clock wise turning
+  const uint32_t powerY   = 4 * 16;
+
+  const uint8_t pinTx     = 17;
+  const uint8_t pinRx     = 16;
+  const int32_t dirX      = -1;    // rise on counterclock wise tunrinig
+  const uint32_t powerX   = 4 * 16; // 4 (pulses per 1 tenth) * 16 (microstep)
+  const uint32_t diveSec  = 40;
   const uint8_t speed[10] = {0x01, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7F};  // ... + 0x80 -> backward
 
 // BT:
@@ -76,6 +78,7 @@ class BT {
     void push() {
       for (int i = 0; i < tx.size(); i++) {
         SerialBT.write(tx[i]);
+        Serial.print(tx[i]);
         delay(2);
       }
       tx.erase();
@@ -95,15 +98,9 @@ bool inRange(int32_t item, int32_t min, int32_t max) {
 
 class Driver57 {
   public:
-    Driver57(uint8_t axisNumber_) {
-      if (axisNumber_ == 1) {
-        SerialX.begin(band, SERIAL_8N1, pinRxX, pinTxX);
-        SerialServo = &SerialX;
-      }
-      if (axisNumber_ == 2) {
-        SerialY.begin(band, SERIAL_8N1, pinRxY, pinTxY);
-        SerialServo = &SerialY;
-      }
+    Driver57() {
+      SerialX.begin(band, SERIAL_8N1, pinRx, pinTx);
+      SerialServo = &SerialX;
     }
     bool pull(struct commandStruct &answer) {
       uint8_t bytecode[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -232,6 +229,76 @@ class Driver57 {
     }
 };
 
+class Pulsar {
+  public:
+    Pulsar() {
+    }
+
+    void roll(int32_t tenths, int32_t seconds) {
+      setDirect(tenths > 0);
+      int32_t pulses = abs(tenths) * powerY;
+      int32_t microdelay = 1000000 * seconds / pulses;
+      for (int i = 0; i < pulses; i++) {
+        kick(microdelay);
+        if (i % powerY == 0)  bt.push((tenths < 0) ? "v" : "^");
+      }
+      bt.push(" ok\n");
+    }
+
+    void rollFromBorder(int32_t tenths, int32_t seconds) {
+      setDirect(tenths > 0);
+      int32_t pulses = abs(tenths) * powerY;
+      int32_t microdelay = 1000000 * seconds / pulses;
+      for (int i = 0; i < pulses; i++) {
+        kick(microdelay);
+        if (i % powerY == 0)  bt.push((tenths < 0) ? "v" : "^");
+        // check alarm in BT:
+          if (SerialBT.available()) {
+            std::string rx = bt.pull();
+            if (rx[0] == 'a' || rx[0] == 'A') {
+              toBorder();
+              i = 0;
+            }
+          }
+      }
+      bt.push(" ok\n");
+    }
+
+
+    void toBorder() {
+      bt.push("\ntoBorder() started... ");
+      setDirect(false);
+      int32_t counter = 0;
+
+      while (counter < 100)
+        if (isOnEnd())
+          counter++;
+        else {
+          kick(30);
+          if (counter > 0) counter--;
+        }
+
+      setDirect(true);
+      delay(10);
+      bt.push("toBorder() finished!");
+    }
+  private:
+    void setDirect(bool direction) {
+      digitalWrite(pinDir, direction ? LOW : HIGH);
+      delay(10);      
+    }
+    void kick(uint32_t timeDelay) {
+      cutter.checkBT();
+      delayMicroseconds(timeDelay);
+      digitalWrite(pinPulse, HIGH);
+      digitalWrite(pinPulse,  LOW);
+    }
+    bool isOnEnd() {
+      // Serial.println(analogRead(pinEnd));
+      return analogRead(pinEnd) == 0;
+    }
+};
+
 class Axis {
   public:
     Axis(Driver57& driver_, uint8_t axisNumber_, int32_t dir_, int32_t power_, int32_t min_, int32_t max_, int32_t current_) 
@@ -273,7 +340,7 @@ class Axis {
       target *= 100;
       uint32_t start = millis();
       // bt.push("\n  wait " + axisName + " rollup...");
-      while (!inRange(getServoCurrent(), target - tolerance, target + tolerance));
+      while (!inRange(getServoCurrent() + 260, target - tolerance, target + tolerance));
       // bt.push(" take " + std::to_string(millis() - start));
     }
     void waitOutServoErrors(int32_t tolerance) {
@@ -330,15 +397,13 @@ class Axis {
     int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
     int32_t min;
     int32_t max;
-    int32_t current;     // current == servo * power
-    int32_t servoShift = 0;
+    int32_t current;      // current == servo * power
+    int32_t servoShift = 260;
 };
 
 class Cutter {
   public:
-    Cutter (Axis &x_, Axis &y_) : x{x_}, y{y_} {
-      leftSlotCenter = center - widthSlot * (slots / 2);
-      leftSlotCenter += (slots % 2 == 0) ? (widthSlot / 2) : 0;
+    Cutter (Axis &x_, Pulsar &y_) : x{x_}, y{y_} {
     }
     void checkBT() {
       if (!SerialBT.available())
@@ -355,11 +420,8 @@ class Cutter {
       if (rx.length() == 1) {
         if (rx[0] == 'a')  takeAlarm();
         if (rx[0] == 'p')  takePause();
-        if (rx[0] == 's')  shaveShaft();
-        if (rx[0] == 'c')  sliceShaft();
-        if (rx[0] == 't')  cutTail();
-        if (rx[0] == 'f')  finaliseTale();
         if (rx[0] == 'h')  halfShaft();
+        if (rx[0] == 'b')  y.toBorder();
         if (rx[0] == 'A') {
           flagAbort = true;
           bt.push("\nProgram aborted");
@@ -374,206 +436,86 @@ class Cutter {
         uint8_t direction = rx[1];
         int32_t target = std::atoi(rx.substr(2,4).c_str());
         // call go() - turn motor and report to BT
-        go(direction, speed[speedIndex], target, lockCurrent);
+        go(direction, speedIndex, target, lockCurrent);
       }
       else
         bt.push((std::string) "\nCommand not detected\n");
     }
   private:
     Axis &x;
-    Axis &y;
+    Pulsar &y;
 
     void go(char dir, uint8_t speed, int32_t target) {  // call unlocked go(). Intended not for manual commands!!!
       if (flagAbort) return;
       checkBT();
       go(dir, speed, target, false);
     }
-    void go(char dir, uint8_t speed, int32_t target, bool lockCurrent) { // 230404 edjast target, edjast if target is out of border, call Axis.go(...)
+    void go(char dir, uint8_t speedIndex, int32_t target, bool lockCurrent) { // 230404 edjast target, edjast if target is out of border, call Axis.go(...)
       // break in case of zero distance:
-        if ((target == 0) || (speed == 0))  return;
-      // set new pointer, min and max limits to selected axis; or break in case of the erroneous direction:
-        Axis* axis;
-        Axis* axis2;
-        if (dir == 'x' || dir == 'l' || dir == 'r')  {  axis = &x;  axis2 = &y;  }
-        if (dir == 'y' || dir == 'i' || dir == 'o')  {  axis = &y;  axis2 = &x;  }
-      // calculate target in case relative coordinate
-        int32_t distance = target;
-        if (dir == 'r' || dir == 'o')  target = axis -> getCurrent() + distance;
-        if (dir == 'l' || dir == 'i')  target = axis -> getCurrent() - distance;
-      // adjust target if out of borders:
-        target = min((axis -> getMax()), target);
-        target = max((axis -> getMin()), target);
-      // call adjusted axis.go()
-        distance = target - axis -> getCurrent();
-        axis -> go(speed, distance, lockCurrent);
-      // wait finishing
-        axis -> waitOutServoErrors(10);
-        axis2-> waitOutServoErrors(10);
-        // bt.push(getCurrentStr());
-        // bt.push(getServoCurrentStr());
-        // bt.push("\n");
-    }
-    void shaveShaft() { // s 230319 reset radiusShaft to current Y value and shave shaft to this
-      uint32_t start = millis();
-      bt.push("\nshaveShaft start " + getCurrentStr());
-      radiusShaft = y.getCurrent();
-      go('y', speed[9], radiusBorder);
-      go('x', speed[7], borderLeft);
-      go('y', speed[9], radiusShaft + 1);
-      go('x', speed[6], borderRight);
-      go('y', speed[2], radiusShaft);
-      go('x', speed[4], borderLeft);
-      go('y', speed[9], radiusBorder);
-      go('x', speed[7], leftSlotCenter);
-      go('y', speed[4], radiusShaft);
-      bt.push("\nshaveShaft take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void sliceShaft() { // c 230325 cuts all slots
-      uint32_t start = millis();
-      bt.push("\nsliceShaft start " + getCurrentStr());
-      // parameters of new approach:
-        int32_t currentSlot = (x.getCurrent() - leftSlotCenter + (widthSlot / 2)) / widthSlot;
-        int32_t currentY = y.getCurrent();
-        int32_t gapX = widthGap;
-        int32_t bottomY = radiusSlot + 1;
-        int32_t borderY = radiusShaft + 5;
-        int32_t targetY = max(bottomY, currentY - slice * layers);
-      // slice the shaft:
-      while (currentY > bottomY) {          // itterate approaches while not get bottom...
-        for (int i = currentSlot; i < slots; i++) {   // itterate slots in approach...
-          currentSlot = 0;  // significant currentSlot useful only in first itteration and must be equal 0 each next itteration
-          int32_t centerX = leftSlotCenter + i * widthSlot;
-          go('y', speed[9], borderY);
-          go('x', speed[7], centerX);
-          go('y', speed[9], currentY);
-          int32_t targetYY = currentY;
-          while (targetYY > targetY) {      // cut out one slot...
-            int32_t currentSlice = (targetYY < bottomY + 7) ? 1 : slice;
-            targetYY = max(targetYY - currentSlice, bottomY);  // decrement targetYY by slice, but control bottomY
-            go('y', speed[1], targetYY);        delay(400);
-            go('x', speed[1], centerX - gapX);  delay(300);
-            go('x', speed[2], centerX + gapX);  delay(300);
-            go('x', speed[4], centerX);
-          }
-        }
-        currentY = targetY;
-        targetY -= (slice * layers);  // decrement targetYY by slice * layers
-      }
-      go('y', speed[9], borderY);
-      bt.push("\ncurrent " + getCurrentStr());
+        if ((target == 0) || (speedIndex == 0))  return;
 
-      // finalise the shaft (left edges side):
-      bt.push("\nwait 10 sec");
-      delay(10000); // wait low shaft temperature
-      targetY = bottomY;
-      for (int i = slots - 1; i >= 0; i--) {
-        int32_t centerX = leftSlotCenter + i * widthSlot;
-        go('y', speed[9], borderY);
-        go('x', speed[7], centerX - gapX - 1);
-        go('y', speed[4], targetY);
-        go('x', speed[2], centerX);
+        if (dir == 'x' || dir == 'l' || dir == 'r')  {
+          // calculate target in case relative coordinate
+            int32_t distance = target;
+            if (dir == 'r')  target = x.getCurrent() + distance;
+            if (dir == 'l')  target = x.getCurrent() - distance;
+          // adjust target if out of borders:
+            target = min((x.getMax()), target);
+            target = max((x.getMin()), target);
+          // call adjusted axis.go()
+            distance = target - x.getCurrent();
+            x.go(speed[speedIndex], distance, lockCurrent);
+          // wait finishing
+            x.waitOutServoErrors(10);
         }
 
-      // finalise the shaft (right edges side):
-      bt.push("\nwait 10 sec");
-      delay(10000); // wait low shaft temperature
-      targetY = bottomY;
-      for (int i = 0; i < slots; i++) {
-        int32_t centerX = leftSlotCenter + i * widthSlot;
-        go('y', speed[9], borderY);
-        go('x', speed[7], centerX + gapX + 1);
-        go('y', speed[4], targetY);
-        go('x', speed[2], centerX);
-      }
-
-      // come close to the left side of tail:
-      go('y', speed[9], borderY);
-      go('x', speed[7], leftSlotCenter + (slots * widthSlot) + 1);
-      go('y', speed[9], radiusShaft);
-      
-      // BT report:
-      bt.push("\nsliceShaft take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void cutTail() {    // t 230319
-      uint32_t start = millis();
-      bt.push("\ncutTale start " + getCurrentStr());
-
-      int32_t left = x.getCurrent() + 1;
-      int32_t right = borderRight;
-      int32_t target = y.getCurrent();
-      int32_t bottom = radiusTail + 1;
-      while (target > bottom) {
-        target = max(target - slice, bottom);
-        go('x', speed[7], right);
-        go('y', speed[7], target);
-        go('x', speed[5], left);
-      }
-      // precise cut of fail
-      finaliseTale();
-      
-      bt.push("\ncutTale take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void finaliseTale() {// p 230319 - make corner (1 tenth left & 1 tenth deep from current)
-      uint32_t start = millis();
-      bt.push("\nfinaliseTale start " + getCurrentStr());
-      int32_t left = x.getCurrent() - 1;
-      int32_t right = borderRight;
-      int32_t bottom = y.getCurrent() - 1;
-      int32_t border = radiusShaft;
-      // finish walk
-        go('y', speed[9], border);
-        go('x', speed[2], left);
-        go('y', speed[3], bottom);
-        go('x', speed[2], right);
-      // back to new corner
-        go('y', speed[9], radiusShaft);
-        go('x', speed[7], left);
-      bt.push("\nfinaliseTale take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
+        if (dir == 'o') y.roll(-target, diveSec);
+        if (dir == 'i') y.roll(target, diveSec);
     }
     void halfShaft() {  // h - slice right shaft half (slice and make corner). Cut with 4mm cutter
-      int32_t zeroSlotX = x.getCurrent();
-      int32_t shiftSlot = 45;
-      int32_t halfShaftSlots = 45;
-      int32_t slotBorder = 260;
-      int32_t slotRadius = 120;
-      int32_t cornerLeft = (halfShaftSlots + 1) * shiftSlot + 5;
-      int32_t cornerRight = 5050;
-      int32_t cornerRadius = 130;
-      int32_t thickLayer = 2;
-      int32_t thinLayer = 1;
+      // init values:
+        bt.push("halfShaft() started... ");
+        int32_t zeroSlotX = x.getCurrent();
+        int32_t shiftSlot = 45;
+        int32_t halfShaftSlots = 45;
+        int32_t cornerLeft = zeroSlotX + ((halfShaftSlots + 1) * shiftSlot) + 7;
+        int32_t cornerRight = 5050;
+
       // slice shaft
-      for (int i = 1; i <= halfShaftSlots; i++) {
-        go('y', speed[9], slotBorder);
-        go('x', speed[7], (i * shiftSlot) + zeroSlotX);
-        go('y', speed[1], radiusBorder);
-        delay(1000);
-      }
-      // make left side of corner
-      go('y', speed[9], slotBorder);
-      go('x', speed[7], cornerLeft);
-      go('y', speed[1], cornerRadius);
-      delay(1000);
-      go('y', speed[9], slotBorder);
-      // make corner      
-      int32_t currentY = 250;
-      while (currentY < cornerRadius) {
-        currentY -= (currentY > 132) ? thickLayer : thinLayer;
+        y.toBorder();
+        for (int i = 1; i <= halfShaftSlots; i++) {
+          go('x', speed[7], (i * shiftSlot) + zeroSlotX);
+          // y.roll(140, 40);
+          y.roll(140, (45 - i * 3));
+          delay(100);
+          y.toBorder();
+        }
         go('x', speed[7], cornerRight);
-        go('y', speed[1], currentY);
-        go('x', speed[3], cornerLeft);
-      }
+
+      // make corner in general
+        for (int i = 0; i < 13; i++) {
+          y.roll(5, 2);
+          go('x', speed[6], cornerLeft);
+          y.roll(5, 2);
+          go('x', speed[6], cornerRight);
+        }
+        y.toBorder();
+
+      // make corner accurate
+        go('x', speed[7], cornerLeft - 2);
+        y.roll(132, 10);
+        delay(1000);
+        go('x', speed[1], cornerRight);
+        y.toBorder();
+      
       // go to start next half shaft
-      go('y', speed[9], slotBorder);
-      go('x', speed[7], zeroSlotX);
+        go('x', speed[7], zeroSlotX);
+        bt.push("halfShaft() finished... ");
     }
     void takeAlarm() {
       // remember current position:
         bt.commit(getCurrentStr());   // don't push to BT in this line for the immediate cutter removal 
-        int32_t memoryY = y.getCurrent();
+        int32_t memoryY = 260; //y.getCurrent();
       // unroll and wait next BT command:
         go('y', speed[9], radiusBorder);
         bt.push("\nALARM !!! on Y = " + memoryY);
@@ -611,11 +553,10 @@ class Cutter {
 };
 
 // objects:
-  Driver57 driverX{1};
-  Driver57 driverY{2};
-  Axis x{driverX, 0x01, dirX, powerX, borderLeft, borderRight, center};
-  Axis y{driverY, 0x02, dirY, powerY, radiusSlot, radiusBorder, radiusBorder};
-  Cutter cutter{x, y};
+  Driver57 driverX{};
+  Axis axisX{driverX, 0x01, dirX, powerX, borderLeft, borderRight, center};
+  Pulsar pulsarY{};
+  Cutter cutter{axisX, pulsarY};
 
 void setup() {
   // BT init:
@@ -626,11 +567,16 @@ void setup() {
       SerialBT.setPin(pin);
       Serial.println("Using PIN");
     #endif
-
-  delay(5000);
-  x.setServoShift();
-  y.setServoShift();
-  bt.push("\nBTLathe ready to execute commands\n");
+  
+  // pulsar init:
+    pinMode(pinPulse, OUTPUT);
+    pinMode(pinDir, OUTPUT);
+  
+  // axes start position finding:
+    delay(5000);
+    pulsarY.toBorder();
+    axisX.setServoShift();
+    bt.push("\nBTLathe ready to execute commands\n");
 }
 
 void loop() {
