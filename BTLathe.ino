@@ -7,9 +7,10 @@
   #define RESOLUTION 5000
   const uint32_t band = 38400;
   bool flagAbort;
+  bool flagDebug = false;
 
 // shaft and machine parametres
-  int32_t radiusBorder = 260;
+  int32_t radiusBorder = 262;
   int32_t radiusShaft = 252;
   int32_t radiusSlot = 120;
   int32_t radiusTail = 140;
@@ -20,7 +21,7 @@
   int32_t widthGap = 5;
   int32_t slots = 92;
 
-  int32_t borderLeft = 2400;
+  int32_t borderLeft = 400;
   int32_t borderRight = 5050;
   int32_t center = 2500;  // point of xStart
   int32_t leftSlotCenter; // calculated in constructor of Cutter
@@ -32,9 +33,10 @@
   const uint8_t pinRxX = 16;
   const int32_t dirX = -1;    // rise on counterclock wise tunrinig
   const int32_t dirY = 1;     // rise on clock wise turning
-  const uint32_t powerX = 4 * 16; // 4 (pulses per 1 tenth) * 16 (microstep)
-  const uint32_t powerY = 4 * 64;
-  const uint8_t speed[10] = {0x01, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7F};  // ... + 0x80 -> backward
+  const uint32_t powerX = 4 * 32; // 4 (pulses per 1 tenth) * 32 (microstep)
+  const uint32_t powerY = 4 * 32;
+  const uint32_t releaseX = 100;  // version of servo57c
+  const uint32_t releaseY = 102;
 
 // BT:
   #include "BluetoothSerial.h"
@@ -86,26 +88,27 @@ class BT {
 BT bt{};
 
 bool inRange(int32_t item, int32_t min, int32_t max) {
-  if (!(min <= item && item <= max))
-    delay(1);
-    // bt.push(".");
-    // bt.push("\n    " + std::to_string(min) + "<" + std::to_string(item) + "<" + std::to_string(max));
+  if (flagDebug) {
+    bt.push("\n" + std::to_string(min) + "<" + std::to_string(item) + "<" + std::to_string(max));
+    delay(500);
+  }
   return (min <= item && item <= max);
 }
 
 class Driver57 {
   public:
-    Driver57(uint8_t axisNumber_) {
-      if (axisNumber_ == 1) {
+    Driver57(uint8_t axisIndex) {
+      if (axisIndex == 1) {
         SerialX.begin(band, SERIAL_8N1, pinRxX, pinTxX);
         SerialServo = &SerialX;
       }
-      if (axisNumber_ == 2) {
+      if (axisIndex == 2) {
         SerialY.begin(band, SERIAL_8N1, pinRxY, pinTxY);
         SerialServo = &SerialY;
       }
     }
     bool pull(struct commandStruct &answer) {
+      bool result = false;
       uint8_t bytecode[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
       if (readBytecode(bytecode)) {
         answer.driverIndex = bytecode[1];
@@ -137,9 +140,17 @@ class Driver57 {
             answer.dataByte = (uint8_t) bytecode[3];
             answer.data = 0;
         }
-        return true;
+        result = true;
       }
-      return false;
+      if (flagDebug) {
+        bt.push("\n      get       " + std::to_string(answer.driverIndex) + 
+                                 " " + std::to_string(answer.function) + 
+                                 " " + std::to_string(answer.dataByte) + 
+                                 " " + std::to_string(answer.data) +
+                "\n      bCode");
+        for (int i = 0; i < 10; i++) bt.push(" " + std::to_string(bytecode[i]));
+      }
+      return result;
     }
     void push(struct commandStruct command) {
       uint8_t bytecode[10];
@@ -170,19 +181,43 @@ class Driver57 {
           break;
       }
       SerialServo -> write(bytecode, bytecodeSize);
+      if (flagDebug) {
+        bt.push("\n      send      " + std::to_string(command.driverIndex) + 
+                                 " " + std::to_string(command.function) + 
+                                 " " + std::to_string(command.dataByte) + 
+                                 " " + std::to_string(command.data) +
+                "\n      bCode");
+        for (int i = 0; i < bytecodeSize; i++) bt.push(" " + std::to_string(bytecode[i]));
+      }
     }
+    void push(uint8_t* bytecode) {
+      bytecode[bytecode[0]] = getCRC(&bytecode[1], bytecode[0] - 1); // pass array size of bytecode[0] started from adress &bytecode[1]
+      SerialServo -> write(&bytecode[1], bytecode[0]);
+      if (flagDebug) {
+        bt.push("\n      send      ");
+        Serial.print("        send      ");
+        for (int i = 1; i <= bytecode[0]; i++) {
+          bt.push(" " + std::to_string(bytecode[i]));
+          Serial.print(" " + (String) (int) bytecode[i]);
+        }
+        Serial.println();
+      }
+    }
+
   private:
     HardwareSerial *SerialServo;
     bool readBytecode(uint8_t bytecode[10]) { // return true if successfull read, check, put bytecode
+      if (flagDebug) bt.push("\n      _read");
       uint8_t bytecodeSize = readNextByteRecursive(bytecode, 0, 9);
       return (bytecodeSize > 0);
     }
     uint8_t readNextByteRecursive(uint8_t bytecode[10], int i, int indexCRC) {  // get target bytecode array, index of current uint8_t to read, size of array to read
       uint32_t waiter = 0;
-      while ((waiter++ < 10) && !SerialServo -> available())  // wait next byte
+      while ((waiter++ < 1000) && !SerialServo -> available())  // wait next byte
         delayMicroseconds(100);
       if (SerialServo -> available()) {
         uint8_t incoming = SerialServo -> read();
+        if (flagDebug) bt.push(" " + std::to_string(incoming));
         bytecode[i] = incoming;
         if (i == 0 && incoming == 0xFB)     // continue the reading only if flag 0xFB catched
           return readNextByteRecursive(bytecode, i + 1, indexCRC);
@@ -207,6 +242,7 @@ class Driver57 {
         else if (i == indexCRC && checkCRC(bytecode, indexCRC)) // it is the last recursive itteration - it checks the CRC
             return i + 1;
       }
+      if (flagDebug) bt.push(" noise detected");
       return 0;                   // if correct command was not detected - return bytecodeSize = 0
     }
     uint8_t getCRC(uint8_t bytecode[10], int indexCRC) {
@@ -234,24 +270,25 @@ class Driver57 {
 
 class Axis {
   public:
-    Axis(Driver57& driver_, uint8_t axisNumber_, int32_t dir_, int32_t power_, int32_t min_, int32_t max_, int32_t current_) 
-             : driver{driver_}, axisNumber{axisNumber_}, axisName(axisNumber_ == 1 ? "x" : "y"), dir{dir_}, power{power_}, min{min_}, max{max_}, current{current_} {
+    Axis(Driver57& driver_, uint8_t axisIndex_, int32_t axisDir_, int32_t power_, uint32_t release_, int32_t min_, int32_t max_, int32_t current_) 
+             : driver{driver_}, axisIndex{axisIndex_}, axisName(axisIndex_ == 1 ? "x" : "y"), axisDir{axisDir_}, power{power_}, release{release_}, min{min_}, max{max_}, current{current_} {
+      baseLoopsPerMinute = (release == 100) ? 150 : 30;
     }
     int32_t getServoCurrent() {
       struct commandStruct answer;
-      driver.push(commandStruct {axisNumber, 0x30, 0, 0});
-      while (!(driver.pull(answer) && answer.driverIndex == axisNumber && answer.function == 0x30));
-      return servoShift + (dir * answer.data);
+      driver.push(commandStruct {axisIndex, 0x30, 0, 0});
+      while (!(driver.pull(answer) && answer.driverIndex == axisIndex && answer.function == 0x30));
+      return servoShift + (axisDir * answer.data);
     }
     int32_t getServoError() { // error == 4369  ~  1mm on 5mm step shaft. Return error in range (-10922, 10923)
       struct commandStruct answer;
-      driver.push(commandStruct {axisNumber, 0x39, 0, 0});
-      while (!(driver.pull(answer) && answer.driverIndex == axisNumber && answer.function == 0x39));
+      driver.push(commandStruct {axisIndex, 0x39, 0, 0});
+      while (!(driver.pull(answer) && answer.driverIndex == axisIndex && answer.function == 0x39));
       return answer.data;
     }
     void setServoShift() {    // rarely used precision function
       bt.push("\n" + axisName + " calibrating...");
-      waitOutServoErrors(0);
+      waitOutServoErrors(5);
       int32_t servoCurrent = getServoCurrent();
       servoShift = current * 100 - servoCurrent;
       bt.push("\n    current       " + std::to_string(current));
@@ -261,58 +298,66 @@ class Axis {
       bt.push("\n" + axisName + " calibrated successful\n");
     }
     void waitGoConfirm(uint8_t order) {
-      // uint32_t start = millis();
-      // bt.push((std::string) "\n  get waitGo(" + std::to_string(order) + ") take ");
+      if (flagDebug) bt.push("\n  waitGoConfirm() started " + axisName);
       struct commandStruct answer;
-      while (!(driver.pull(answer) && answer.driverIndex == axisNumber    // try to read driver. In success case driver put answer and return true
+      while (!(driver.pull(answer) && answer.driverIndex == axisIndex    // try to read driver. In success case driver put answer and return true
                                    && answer.function    == 0xFD
-                                   && answer.dataByte    == order));
-      // bt.push(std::to_string(millis() - start));
+                                   && answer.dataByte    == order))
+        if (flagDebug) {
+          bt.push(".");
+          delay(500);
+        }
+      if (flagDebug) bt.push("finished");
     }
     void waitOutServoRollUp(int32_t target, int32_t tolerance) {
+      if (flagDebug) bt.push("\n  waitOutServoRollUp() started " + axisName);
       target *= 100;
       uint32_t start = millis();
-      // bt.push("\n  wait " + axisName + " rollup...");
-      while (!inRange(getServoCurrent(), target - tolerance, target + tolerance));
-      // bt.push(" take " + std::to_string(millis() - start));
+      while (!inRange(getServoCurrent(), target - tolerance, target + tolerance)) {
+        if (flagDebug) delay(500);
+        bt.push(">");
+        delay(100);
+      }
+      if (flagDebug) bt.push(" finished");
     }
     void waitOutServoErrors(int32_t tolerance) {
-      uint32_t start = millis();
-      // bt.push("\n  wait " + axisName + " errors...");
-      while (!inRange(getServoError(), -tolerance, tolerance));
-      // bt.push(" take " + std::to_string(millis() - start));
+      if (flagDebug) bt.push("\n  waitOutServoErrors() started " + axisName);
+      while (!inRange(getServoError(), -tolerance, tolerance)) {
+        if (flagDebug) delay(500);
+        bt.push("!");
+        delay(100);
+      }
+      if (flagDebug) bt.push(" finished");
     }
-    void go(uint8_t speed, int32_t distance, bool lockCurrent) {
-      uint32_t start = millis();
+    void go(int32_t speed, int32_t distance, bool lockCurrent) {
       bt.push(axisName + ' ');
       // reject trivial requests
-        if (distance == 0 || speed == 0) {
+        if (distance == 0) {
           bt.push("reject trivial go\n");
           return;
         }
       // adjust parameters
-        int32_t pulses = abs(distance * power);
-        speed += 0x80 * ((distance * dir) > 0);
+        int pulses = abs(distance * power);
+        int direction = (distance > 0) ? 1 : -1;
       // report BT about go
         std::stringstream stream;
-        stream << current << " -> " << current + distance << " s" << (int32_t) speed << " ";
+        stream << current << " -> " << current + distance << " s" << speed << " ";
         bt.push(stream.str());
-      // request go() to driver
-        // bt.push("\n  send go() take ");
-        driver.push(commandStruct {axisNumber, 0xFD, speed, pulses});
-        // bt.push(std::to_string(millis() - start));
+      // request go function depend of driver version
+        if (release == 100) goRequest_v100(direction, speed, pulses);
+        else                goRequest_v101(direction, speed, pulses);
       // wait go() confirm
         waitGoConfirm(1);
         waitGoConfirm(2);
-      // wait support roll up to the goal
-        waitOutServoRollUp(current + distance, 100);
+      // wait the support roll up to the goal
+        waitOutServoRollUp(current + distance, 25); // second parameter - specified in microns
       // turn current or servoShift
         if (lockCurrent)
           servoShift -= (distance * 100);
         else
           current += distance;
-        bt.push("ok\n");
-    }
+        bt.push(" ok\n");
+    }    
     int32_t getCurrent() {
       return current;
     }
@@ -324,14 +369,69 @@ class Axis {
     }
   private:
     Driver57 &driver;
-    uint8_t axisNumber;   // used to mark rs485 commands
+    uint8_t axisIndex;   // used to mark rs485 commands
     std::string axisName = "defaultAxisName";
-    int32_t dir;
+    int32_t axisDir;
     int32_t power;        // quantity of pulses per one tenth (to shaft and motor where 5mm shift per 200 pulses power = 4 * microstep)
+    uint32_t release;
     int32_t min;
     int32_t max;
     int32_t current;     // current == servo * power
-    int32_t servoShift = 0;
+    int32_t servoShift = 0; // firstival calc of servoShift founds to this 0
+    int32_t baseLoopsPerMinute;
+    void goRequest_v100(int direction, int speed, int pulses) {
+      // request go() to driver
+        if (flagDebug) {
+          bt.push("\n goRequest_v100 started");
+          bt.push("\n direction = " + std::to_string(direction));
+          bt.push("\n speed     = " + std::to_string(speed));
+          bt.push("\n pulses    = " + std::to_string(pulses));
+        }
+        speed = (speed + 4) / 5;
+        speed = (speed < 1) ? 1 : speed;
+        uint8_t bytecode[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        bytecode[0] = 0x09; // 0x0B == 11   // element 0 point the size of sended bytecode (without the bytecode[0])
+        bytecode[1] = 0xFA; // marks bytecode like sending
+        bytecode[2] = axisIndex;
+        bytecode[3] = 0xFD; // command to turn the motor
+        bytecode[4] = (direction * axisDir == 1) ? 0b10000000 : 0b00000000; // B4b7 - direction
+        if (flagDebug) bt.push("\n bc4 = " + std::to_string(bytecode[4]));
+        bytecode[4]+= speed % 0x80;  // B4b6-b0 - speed value
+        if (flagDebug) bt.push("\n bc4 = " + std::to_string(bytecode[4]));
+        bytecode[5] = (pulses % 0x100000000) / 0x1000000;
+        bytecode[6] = (pulses % 0x1000000) / 0x10000;
+        bytecode[7] = (pulses % 0x10000) / 0x100;
+        bytecode[8] = (pulses % 0x100) / 0x1;          
+        driver.push(bytecode);
+        if (flagDebug) bt.push("\n goRequest_v100 finished ");
+    }
+    void goRequest_v101(int direction, int speed, int pulses) {
+      // request go() to driver
+        if (flagDebug) {
+          bt.push("\n goRequest_v101 started");
+          bt.push("\n direction = " + std::to_string(direction));
+          bt.push("\n speed     = " + std::to_string(speed));
+          bt.push("\n pulses    = " + std::to_string(pulses));
+        }
+        speed = (speed < 1) ? 1 : speed;
+        uint8_t bytecode[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        bytecode[0]  = 0x0B; // 0x0B == 11   // element 0 point the size of sended bytecode (without the bytecode[0])
+        bytecode[1]  = 0xFA; // marks bytecode like sending
+        bytecode[2]  = axisIndex;
+        bytecode[3]  = 0xFD; // command to turn the motor
+        bytecode[4]  = (direction * axisDir == 1) ? 0b10000000 : 0b00000000; // B4b7 - direction
+        if (flagDebug) bt.push("\n bc4 = " + std::to_string(bytecode[4]));
+        bytecode[4] += speed / 0x100;  // B4b3-b0 - high section of speed value
+        if (flagDebug) bt.push("\n bc4 = " + std::to_string(bytecode[4]));
+        bytecode[5]  = speed % 0x100;  // B4b7-b0 - low  section of speed value
+        bytecode[6]  = 0x20; // B6 - acceleration; range from 0x00 (no acceleration) to 0x20
+        bytecode[7]  = (pulses % 0x100000000) / 0x1000000;
+        bytecode[8]  = (pulses % 0x1000000) / 0x10000;
+        bytecode[9]  = (pulses % 0x10000) / 0x100;
+        bytecode[10] = (pulses % 0x100) / 0x1;          
+        driver.push(bytecode);
+        if (flagDebug) bt.push("\n goRequest_v101 finished ");
+    }
 };
 
 class Cutter {
@@ -341,65 +441,77 @@ class Cutter {
       leftSlotCenter += (slots % 2 == 0) ? (widthSlot / 2) : 0;
     }
     void checkBT() {
-      if (!SerialBT.available())
-        return;
-      const String strNumbers = "1234567890";
-      const String strDirections = "xylrio";
+      if (!SerialBT.available())  return;
+      char const* digits = "0123456789";
+      char const* directions = "xylrio";
+      char const* lockedDirections = "XYLRIO";
       // pull BT
-      std::string rx = bt.pull();
-      Serial.println("checkBT got <" + (String) rx.data() + ">");
-      // check lockCurrent:
-      bool lockCurrent = (rx[0] == 'l');
-      if (rx[0] == 'l')  rx[0] = '4';
+        std::string rx = bt.pull();
+        Serial.println("checkBT got <" + (String) rx.data() + ">");
       // check onechar commands:
-      if (rx.length() == 1) {
-        if (rx[0] == 'a')  takeAlarm();
-        if (rx[0] == 'p')  takePause();
-        if (rx[0] == 's')  shaveShaft();
-        if (rx[0] == 'c')  sliceShaft();
-        if (rx[0] == 't')  cutTail();
-        if (rx[0] == 'f')  finaliseTale();
-        if (rx[0] == 'h')  halfShaft();
-        if (rx[0] == 'A') {
-          flagAbort = true;
-          bt.push("\nProgram aborted");
+        if (rx.length() == 1) {
+          if (rx[0] == 'a') { takeAlarm();      return; }
+          if (rx[0] == 'p') { takePause();      return; }
+          if (rx[0] == 'A') { flagAbort = true; bt.push("\nProgram aborted");   return; }
         }
-      }
+      // check threechar commands:
+        if (rx.length() == 3) {
+          if (rx[0] == 'h' && rx.find_first_of(digits) == 1 && rx.find_last_of(digits) == 2) {
+            int32_t initialSlot = std::atoi(rx.substr(1, 2).c_str());
+            halfShaft(initialSlot);
+            return;
+          }
+        }
       // check multichar commands:
-      else if ((rx.length() > 2) && (rx.length() < 7)
-                                 && (strNumbers.indexOf(rx[0]) > -1)
-                                 && (strDirections.indexOf(rx[1]) > -1)) {
-        // calc other parameters:
-        uint8_t speedIndex = std::atoi(rx.substr(0,1).c_str());
-        uint8_t direction = rx[1];
-        int32_t target = std::atoi(rx.substr(2,4).c_str());
-        // call go() - turn motor and report to BT
-        go(direction, speed[speedIndex], target, lockCurrent);
-      }
-      else
-        bt.push((std::string) "\nCommand not detected\n");
+        else {
+          size_t speedPosition = rx.find_first_of(digits);
+          size_t dirPosition = rx.find_first_of(directions);
+          // check lockCurrent:
+            size_t lockedDirPosition = rx.find_first_of(lockedDirections);
+            bool lockCurrent = false;
+            if (lockedDirPosition != std::string::npos) {
+              lockCurrent = true;
+              dirPosition = lockedDirPosition;
+            }
+          size_t targetPosition = rx.find_first_of(digits, dirPosition);
+          // check correct input:
+            if (speedPosition   != std::string::npos &&
+                dirPosition     != std::string::npos &&
+                targetPosition  != std::string::npos &&
+                speedPosition < dirPosition &&
+                dirPosition   < targetPosition) {
+              // calc other parameters:
+                int32_t speed = std::atoi(rx.substr(speedPosition, dirPosition - speedPosition).c_str());
+                uint8_t direction = rx[dirPosition];
+                int32_t target = std::atoi(rx.substr(targetPosition, rx.length() - targetPosition).c_str());
+              // call go() - turn motor and report to BT
+                go(direction, speed, target, lockCurrent);
+                return;
+            }
+        }
+        bt.push((std::string) " Command unrecognized\n");
     }
   private:
     Axis &x;
     Axis &y;
 
-    void go(char dir, uint8_t speed, int32_t target) {  // call unlocked go(). Intended not for manual commands!!!
+    void go(char dir, int32_t speed, int32_t target) {  // call unlocked go(). Intended not for manual commands!!!
       if (flagAbort) return;
       checkBT();
       go(dir, speed, target, false);
     }
-    void go(char dir, uint8_t speed, int32_t target, bool lockCurrent) { // 230404 edjast target, edjast if target is out of border, call Axis.go(...)
+    void go(char dir, int32_t speed, int32_t target, bool lockCurrent) { // 230404 edjast target, edjast if target is out of border, call Axis.go(...)
       // break in case of zero distance:
-        if ((target == 0) || (speed == 0))  return;
+        if (target == 0)  return;
       // set new pointer, min and max limits to selected axis; or break in case of the erroneous direction:
         Axis* axis;
         Axis* axis2;
-        if (dir == 'x' || dir == 'l' || dir == 'r')  {  axis = &x;  axis2 = &y;  }
-        if (dir == 'y' || dir == 'i' || dir == 'o')  {  axis = &y;  axis2 = &x;  }
+        if (dir == 'x' || dir == 'l' || dir == 'r' || dir == 'X' || dir == 'L' || dir == 'R')  {  axis = &x;  axis2 = &y;  }
+        if (dir == 'y' || dir == 'i' || dir == 'o' || dir == 'Y' || dir == 'I' || dir == 'O')  {  axis = &y;  axis2 = &x;  }
       // calculate target in case relative coordinate
         int32_t distance = target;
-        if (dir == 'r' || dir == 'o')  target = axis -> getCurrent() + distance;
-        if (dir == 'l' || dir == 'i')  target = axis -> getCurrent() - distance;
+        if (dir == 'r' || dir == 'o' || dir == 'R' || dir == 'O')  target = axis -> getCurrent() + distance;
+        if (dir == 'l' || dir == 'i' || dir == 'L' || dir == 'I')  target = axis -> getCurrent() - distance;
       // adjust target if out of borders:
         target = min((axis -> getMax()), target);
         target = max((axis -> getMin()), target);
@@ -407,179 +519,64 @@ class Cutter {
         distance = target - axis -> getCurrent();
         axis -> go(speed, distance, lockCurrent);
       // wait finishing
-        axis -> waitOutServoErrors(10);
-        axis2-> waitOutServoErrors(10);
+        axis -> waitOutServoErrors(25);
+        axis2-> waitOutServoErrors(25);
         // bt.push(getCurrentStr());
         // bt.push(getServoCurrentStr());
         // bt.push("\n");
     }
-    void shaveShaft() { // s 230319 reset radiusShaft to current Y value and shave shaft to this
-      uint32_t start = millis();
-      bt.push("\nshaveShaft start " + getCurrentStr());
-      radiusShaft = y.getCurrent();
-      go('y', speed[9], radiusBorder);
-      go('x', speed[7], borderLeft);
-      go('y', speed[9], radiusShaft + 1);
-      go('x', speed[6], borderRight);
-      go('y', speed[2], radiusShaft);
-      go('x', speed[4], borderLeft);
-      go('y', speed[9], radiusBorder);
-      go('x', speed[7], leftSlotCenter);
-      go('y', speed[4], radiusShaft);
-      bt.push("\nshaveShaft take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void sliceShaft() { // c 230325 cuts all slots
-      uint32_t start = millis();
-      bt.push("\nsliceShaft start " + getCurrentStr());
-      // parameters of new approach:
-        int32_t currentSlot = (x.getCurrent() - leftSlotCenter + (widthSlot / 2)) / widthSlot;
-        int32_t currentY = y.getCurrent();
-        int32_t gapX = widthGap;
-        int32_t bottomY = radiusSlot + 1;
-        int32_t borderY = radiusShaft + 5;
-        int32_t targetY = max(bottomY, currentY - slice * layers);
-      // slice the shaft:
-      while (currentY > bottomY) {          // itterate approaches while not get bottom...
-        for (int i = currentSlot; i < slots; i++) {   // itterate slots in approach...
-          currentSlot = 0;  // significant currentSlot useful only in first itteration and must be equal 0 each next itteration
-          int32_t centerX = leftSlotCenter + i * widthSlot;
-          go('y', speed[9], borderY);
-          go('x', speed[7], centerX);
-          go('y', speed[9], currentY);
-          int32_t targetYY = currentY;
-          while (targetYY > targetY) {      // cut out one slot...
-            int32_t currentSlice = (targetYY < bottomY + 7) ? 1 : slice;
-            targetYY = max(targetYY - currentSlice, bottomY);  // decrement targetYY by slice, but control bottomY
-            go('y', speed[1], targetYY);        delay(400);
-            go('x', speed[1], centerX - gapX);  delay(300);
-            go('x', speed[2], centerX + gapX);  delay(300);
-            go('x', speed[4], centerX);
-          }
-        }
-        currentY = targetY;
-        targetY -= (slice * layers);  // decrement targetYY by slice * layers
-      }
-      go('y', speed[9], borderY);
-      bt.push("\ncurrent " + getCurrentStr());
-
-      // finalise the shaft (left edges side):
-      bt.push("\nwait 10 sec");
-      delay(10000); // wait low shaft temperature
-      targetY = bottomY;
-      for (int i = slots - 1; i >= 0; i--) {
-        int32_t centerX = leftSlotCenter + i * widthSlot;
-        go('y', speed[9], borderY);
-        go('x', speed[7], centerX - gapX - 1);
-        go('y', speed[4], targetY);
-        go('x', speed[2], centerX);
-        }
-
-      // finalise the shaft (right edges side):
-      bt.push("\nwait 10 sec");
-      delay(10000); // wait low shaft temperature
-      targetY = bottomY;
-      for (int i = 0; i < slots; i++) {
-        int32_t centerX = leftSlotCenter + i * widthSlot;
-        go('y', speed[9], borderY);
-        go('x', speed[7], centerX + gapX + 1);
-        go('y', speed[4], targetY);
-        go('x', speed[2], centerX);
-      }
-
-      // come close to the left side of tail:
-      go('y', speed[9], borderY);
-      go('x', speed[7], leftSlotCenter + (slots * widthSlot) + 1);
-      go('y', speed[9], radiusShaft);
-      
-      // BT report:
-      bt.push("\nsliceShaft take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void cutTail() {    // t 230319
-      uint32_t start = millis();
-      bt.push("\ncutTale start " + getCurrentStr());
-
-      int32_t left = x.getCurrent() + 1;
-      int32_t right = borderRight;
-      int32_t target = y.getCurrent();
-      int32_t bottom = radiusTail + 1;
-      while (target > bottom) {
-        target = max(target - slice, bottom);
-        go('x', speed[7], right);
-        go('y', speed[7], target);
-        go('x', speed[5], left);
-      }
-      // precise cut of fail
-      finaliseTale();
-      
-      bt.push("\ncutTale take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void finaliseTale() {// p 230319 - make corner (1 tenth left & 1 tenth deep from current)
-      uint32_t start = millis();
-      bt.push("\nfinaliseTale start " + getCurrentStr());
-      int32_t left = x.getCurrent() - 1;
-      int32_t right = borderRight;
-      int32_t bottom = y.getCurrent() - 1;
-      int32_t border = radiusShaft;
-      // finish walk
-        go('y', speed[9], border);
-        go('x', speed[2], left);
-        go('y', speed[3], bottom);
-        go('x', speed[2], right);
-      // back to new corner
-        go('y', speed[9], radiusShaft);
-        go('x', speed[7], left);
-      bt.push("\nfinaliseTale take " + std::to_string(millis() - start));
-      bt.push("\ncurrent " + getCurrentStr());
-    }
-    void halfShaft() {  // h - slice right shaft half (slice and make corner). Cut with 4mm cutter
+    void halfShaft(int32_t initSlot) {  // h - slice right shaft half (slice and make corner). Cut with 4mm cutter
       int32_t zeroSlotX = x.getCurrent();
       int32_t shiftSlot = 45;
-      int32_t halfShaftSlots = 45;
-      int32_t slotBorder = 260;
+      int32_t slotsNumber = 45;
+      int32_t slotBorder = 255;
       int32_t slotRadius = 120;
-      int32_t cornerLeft = (halfShaftSlots + 1) * shiftSlot + 5;
+      int32_t cornerLeft = (slotsNumber + 1) * shiftSlot + 5;
       int32_t cornerRight = 5050;
-      int32_t cornerRadius = 130;
-      int32_t thickLayer = 2;
-      int32_t thinLayer = 1;
+      int32_t cornerRadius = 150;
+      int32_t layer = 5;
+
       // slice shaft
-      for (int i = 1; i <= halfShaftSlots; i++) {
-        go('y', speed[9], slotBorder);
-        go('x', speed[7], (i * shiftSlot) + zeroSlotX);
-        go('y', speed[1], radiusBorder);
-        delay(1000);
+      go('y', 200, slotBorder);
+      for (int i = initSlot; i <= slotsNumber; i++) {
+        go('x', 200, (i * shiftSlot) + zeroSlotX);
+        go('y',   8, slotRadius + 5);
+        go('y',   2, slotRadius);
+        delay(2000);
+        go('y', 200, slotBorder);
       }
-      // make left side of corner
-      go('y', speed[9], slotBorder);
-      go('x', speed[7], cornerLeft);
-      go('y', speed[1], cornerRadius);
-      delay(1000);
-      go('y', speed[9], slotBorder);
-      // make corner      
-      int32_t currentY = 250;
-      while (currentY < cornerRadius) {
-        currentY -= (currentY > 132) ? thickLayer : thinLayer;
-        go('x', speed[7], cornerRight);
-        go('y', speed[1], currentY);
-        go('x', speed[3], cornerLeft);
+      
+      // make corner
+      int32_t currentY = 252;
+      go('x', 400, cornerRight);
+      for (int i = 0; i < 10; i++) {
+        go('y',  5, currentY - 5);
+        go('x', 20, cornerLeft);
+        go('y',  5, currentY - 10);
+        go('x', 20, cornerRight);
       }
+      go('y', 200, slotBorder);
+
+      // finalyse corner
+        go('x', 200, cornerLeft - 2);
+        go('y',   5, cornerRadius);   delay(1000);
+        go('x',  10, cornerRight);
+        go('y', 200, slotBorder);
+
       // go to start next half shaft
-      go('y', speed[9], slotBorder);
-      go('x', speed[7], zeroSlotX);
+        go('x', 400, zeroSlotX - 5);
+        go('x', 200, zeroSlotX);
     }
     void takeAlarm() {
       // remember current position:
         bt.commit(getCurrentStr());   // don't push to BT in this line for the immediate cutter removal 
         int32_t memoryY = y.getCurrent();
       // unroll and wait next BT command:
-        go('y', speed[9], radiusBorder);
+        go('y', 400, radiusBorder);
         bt.push("\nALARM !!! on Y = " + memoryY);
         waitAbortOrReleaseInput();
         if (flagAbort = false)
-          go('y', speed[2], memoryY);
+          go('y', 10, memoryY);
     }
     void takePause() {
       bt.push("\nPAUSE");
@@ -613,8 +610,8 @@ class Cutter {
 // objects:
   Driver57 driverX{1};
   Driver57 driverY{2};
-  Axis x{driverX, 0x01, dirX, powerX, borderLeft, borderRight, center};
-  Axis y{driverY, 0x02, dirY, powerY, radiusSlot, radiusBorder, radiusBorder};
+  Axis x{driverX, 0x01, dirX, powerX, releaseX, borderLeft, borderRight, center};
+  Axis y{driverY, 0x02, dirY, powerY, releaseY, radiusSlot, radiusBorder, radiusBorder};
   Cutter cutter{x, y};
 
 void setup() {
