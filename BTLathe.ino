@@ -10,9 +10,10 @@
   bool flagDebug = false;
 
 // shaft and machine parametres
-  int32_t radiusBorder = 262;
+  int32_t radiusBorder = 258;
   int32_t radiusShaft = 252;
   int32_t radiusSlot = 120;
+  int32_t radiusMin = -500;
   int32_t radiusTail = 140;
   int32_t slice = 2;    // layer thickness
   int32_t layers = 5;       // layers per approach
@@ -23,8 +24,8 @@
 
   int32_t borderLeft = 400;
   int32_t borderRight = 5050;
-  int32_t center = 2500;  // point of xStart
-  int32_t leftSlotCenter; // calculated in constructor of Cutter
+  int32_t initX = 2500;   // point of xStart
+  int32_t initY = 297;    // point of yStart
 
 // axes:
   const uint8_t pinTxY = 18;
@@ -437,8 +438,6 @@ class Axis {
 class Cutter {
   public:
     Cutter (Axis &x_, Axis &y_) : x{x_}, y{y_} {
-      leftSlotCenter = center - widthSlot * (slots / 2);
-      leftSlotCenter += (slots % 2 == 0) ? (widthSlot / 2) : 0;
     }
     void checkBT() {
       if (!SerialBT.available())  return;
@@ -529,43 +528,71 @@ class Cutter {
       int32_t zeroSlotX = x.getCurrent();
       int32_t shiftSlot = 45;
       int32_t slotsNumber = 45;
-      int32_t slotBorder = 255;
+      int32_t slotBorder = 258;
       int32_t slotRadius = 120;
-      int32_t cornerLeft = (slotsNumber + 1) * shiftSlot + 5;
-      int32_t cornerRight = 5050;
+      int32_t cornerLeft = zeroSlotX + (slotsNumber + 1) * shiftSlot + 5;
+      int32_t cornerRight = 5000;
       int32_t cornerRadius = 150;
       int32_t layer = 5;
 
       // slice shaft
       go('y', 200, slotBorder);
-      for (int i = initSlot; i <= slotsNumber; i++) {
-        go('x', 200, (i * shiftSlot) + zeroSlotX);
-        go('y',   8, slotRadius + 5);
+      bt.push("\n_____start slicer...\n");
+      for (int32_t i = initSlot; i <= slotsNumber; i++) {
+        bt.push("\n_____start edge # " + std::to_string(i) + "\n");
+        go('x', 100, (i * shiftSlot) + zeroSlotX);
+        // go('y',   4, slotRadius + 110);
+        go('y',   9, slotRadius + 5);
         go('y',   2, slotRadius);
-        delay(2000);
-        go('y', 200, slotBorder);
+        delay(500);
+        go('y', 100, slotBorder);
       }
       
       // make corner
-      int32_t currentY = 252;
-      go('x', 400, cornerRight);
-      for (int i = 0; i < 10; i++) {
-        go('y',  5, currentY - 5);
-        go('x', 20, cornerLeft);
-        go('y',  5, currentY - 10);
-        go('x', 20, cornerRight);
+      bt.push("\n_____start corner...\n");
+      go('x', 300, cornerRight);
+      for (int32_t currentY = 242; currentY >= 152; currentY -= 10) {
+        bt.push("\n_____start layer # " + std::to_string((252 - currentY) / 10) + "\n");
+        go('y',  9, currentY + 5);
+        go('x', 25, cornerLeft);
+        go('y',  9, currentY);
+        go('x', 25, cornerRight);
       }
       go('y', 200, slotBorder);
 
       // finalyse corner
+        bt.push("\n_____finalise corner...\n");
         go('x', 200, cornerLeft - 2);
-        go('y',   5, cornerRadius);   delay(1000);
+        go('y',  10, cornerRadius + 2);
+        go('y',   4, cornerRadius);
         go('x',  10, cornerRight);
         go('y', 200, slotBorder);
-
-      // go to start next half shaft
-        go('x', 400, zeroSlotX - 5);
-        go('x', 200, zeroSlotX);
+        go('x', 200, 4000);
+        bt.push("\n_____ready to next job!\n");
+    }
+    void cutPulley() {  // p - cut pulley, with 3mm cutter, width = 17mm
+      int32_t zeroX = x.getCurrent();
+      bt.push("\n_____start cutPulley...\n");
+      // finish right edge
+      go('y', 50, 255);
+      go('x', 50, zeroX - 5);
+      go('y',  9,  60);  delay(300);
+      go('x', 10, zeroX);
+      // cut slot: 6mm width, 3mm depth
+      go('y', 50, 255);
+      go('y',  9, 250);      
+      go('x', 50, zeroX - 118);
+      go('y',  9, 220);
+      go('y', 50, 255);
+      go('x', 50, zeroX - 90);  delay(300);
+      go('y',  9, 220);
+      go('x', 50, zeroX - 118); delay(300);
+      // cut off the pulley
+      go('y', 50, 255);
+      go('y',  9, 250);
+      go('x', 50, zeroX - 200);
+      go('y',  9,  70);
+      bt.push("\nUse 10i2 button to cut off the pulley.\n");
     }
     void takeAlarm() {
       // remember current position:
@@ -610,8 +637,8 @@ class Cutter {
 // objects:
   Driver57 driverX{1};
   Driver57 driverY{2};
-  Axis x{driverX, 0x01, dirX, powerX, releaseX, borderLeft, borderRight, center};
-  Axis y{driverY, 0x02, dirY, powerY, releaseY, radiusSlot, radiusBorder, radiusBorder};
+  Axis x{driverX, 0x01, dirX, powerX, releaseX, borderLeft, borderRight,  initX};
+  Axis y{driverY, 0x02, dirY, powerY, releaseY, radiusMin, radiusBorder, initY};
   Cutter cutter{x, y};
 
 void setup() {
